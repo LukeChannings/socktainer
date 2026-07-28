@@ -657,6 +657,32 @@ struct ConvertPortBindingsTests {
         #expect(ports.count == 1)
         #expect(ports[0].hostPort != 0)
     }
+
+    @Test("a bare port number (no /proto) is treated as /tcp, matching Docker and Testcontainers")
+    func barePortDefaultsToTcp() throws {
+        // Testcontainers sends PortBindings keyed by a suffix-less port, e.g.
+        // {"6379": [{"HostPort": "0"}]}. Docker treats that as "6379/tcp"; if we
+        // drop it, `getMappedPort` finds no binding and Ryuk cannot start.
+        let ports = try convertPortBindings(from: ["6379": [PortBinding(HostIp: nil, HostPort: "0")]])
+        #expect(ports.count == 1)
+        #expect(ports[0].containerPort == 6379)
+        #expect(ports[0].proto.rawValue == "tcp")
+        #expect(ports[0].hostPort != 0)
+    }
+
+    @Test("a /udp suffix is honored")
+    func udpSuffixHonored() throws {
+        let ports = try convertPortBindings(from: ["53/udp": [PortBinding(HostIp: nil, HostPort: "53")]])
+        #expect(ports.count == 1)
+        #expect(ports[0].proto.rawValue == "udp")
+    }
+
+    @Test("malformed specs (non-numeric port, too many components, unknown proto) are skipped")
+    func malformedSpecsSkipped() throws {
+        #expect(try convertPortBindings(from: ["notaport": [PortBinding(HostIp: nil, HostPort: "0")]]).isEmpty)
+        #expect(try convertPortBindings(from: ["80/tcp/extra": [PortBinding(HostIp: nil, HostPort: "0")]]).isEmpty)
+        #expect(try convertPortBindings(from: ["80/sctp": [PortBinding(HostIp: nil, HostPort: "0")]]).isEmpty)
+    }
 }
 
 @Suite("ContainerCreateRoute — image existence error mapping")

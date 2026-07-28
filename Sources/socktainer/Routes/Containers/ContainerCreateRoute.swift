@@ -871,15 +871,18 @@ func convertPortBindings(from portBindings: [String: [PortBinding]]) throws -> [
     var publishedPorts: [PublishPort] = []
 
     for (portSpec, bindings) in portBindings {
-        // Parse the port specification (e.g., "5432/tcp")
+        // Parse the port specification (e.g. "5432/tcp"). Docker also accepts a
+        // bare port number with no protocol suffix (e.g. "5432") and treats it
+        // as "/tcp" — the form Testcontainers sends — so default the protocol
+        // rather than dropping the binding.
         let components = portSpec.split(separator: "/")
-        guard components.count == 2,
+        guard components.count >= 1, components.count <= 2,
             let containerPort = UInt16(components[0])
         else {
             continue  // Skip invalid port specifications
         }
 
-        let protoString = String(components[1])
+        let protoString = components.count == 2 ? String(components[1]) : "tcp"
         guard let proto = PublishProtocol(rawValue: protoString) else {
             continue  // Skip unsupported protocols
         }
