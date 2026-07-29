@@ -255,6 +255,12 @@ struct ClientArchiveService: ClientArchiveProtocol {
             }
 
             let reader = try EXT4.EXT4Reader(blockDevice: FilePath(rootfsPath.path))
+            // Docker returns 404 ("no such file or directory") when the destination
+            // path does not exist inside the container, and 400 when it exists but
+            // is not a directory. The running-container path enforces this in the
+            // guest via `prepareGuestForCopy`; mirror it here so the offline path
+            // doesn't silently create arbitrary directory trees on typos.
+            try validateOfflineDestination(reader: reader, destinationPath: normalizedPath)
             try validateArchiveEntries(
                 reader: reader,
                 tarPath: tarPath,
@@ -617,6 +623,31 @@ struct ClientArchiveService: ClientArchiveProtocol {
             return nil
         }
         return String(data: data, encoding: .utf8)
+    }
+
+    /// Enforce Docker's PUT-archive destination semantics against the offline
+    /// rootfs. Missing destination → `pathNotFound` (404); resolved destination
+    /// that is not a directory → `invalidPath` (400).
+    private func validateOfflineDestination(
+        reader: EXT4.EXT4Reader,
+        destinationPath: String
+    ) throws {
+        // Trailing slashes on anything other than "/" itself are cosmetic and
+        // ext4 lookups reject them.
+        var normalized = destinationPath
+        while normalized.count > 1 && normalized.hasSuffix("/") {
+            normalized.removeLast()
+        }
+        let filePath = FilePath(normalized)
+        guard reader.exists(filePath) else {
+            throw ClientArchiveError.pathNotFound(path: destinationPath)
+        }
+        // stat with followSymlinks: true (the default) resolves the destination
+        // the same way Docker does before deciding whether it is a directory.
+        let (_, inode) = try reader.stat(filePath)
+        guard inode.isDirectory else {
+            throw ClientArchiveError.invalidPath(path: destinationPath)
+        }
     }
 
     private func validateArchiveEntries(
