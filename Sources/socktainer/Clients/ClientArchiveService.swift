@@ -107,9 +107,11 @@ protocol ClientArchiveProtocol: Sendable {
 /// Service for performing archive operations on container filesystems
 struct ClientArchiveService: ClientArchiveProtocol {
     private let appSupportPath: URL
+    private let rootfsProvisioner: ContainerRootfsProvisioner
 
     init(appSupportPath: URL) {
         self.appSupportPath = appSupportPath
+        self.rootfsProvisioner = ContainerRootfsProvisioner(appSupportPath: appSupportPath)
     }
 
     /// Get the path to a container's rootfs.ext4 file
@@ -220,6 +222,19 @@ struct ClientArchiveService: ClientArchiveProtocol {
         }
 
         let rootfsPath = getRootfsPath(containerId: container.id)
+
+        // A created-but-not-started container has no rootfs.ext4 yet: Apple
+        // materialises it lazily at start. Materialise the full bundle now (as
+        // bootstrap would) so the archive can be injected offline; the later
+        // start reuses this rootfs with the injected files intact.
+        if !FileManager.default.fileExists(atPath: rootfsPath.path) {
+            do {
+                try await rootfsProvisioner.ensureRootfs(containerId: container.id)
+            } catch {
+                throw ClientArchiveError.operationFailed(
+                    message: "Failed to provision rootfs for created container \(container.id): \(error.localizedDescription)")
+            }
+        }
 
         guard FileManager.default.fileExists(atPath: rootfsPath.path) else {
             throw ClientArchiveError.rootfsNotFound(id: container.id)
