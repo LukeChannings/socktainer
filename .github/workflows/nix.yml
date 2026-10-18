@@ -45,6 +45,12 @@ jobs:
     name: Build socktainer
     runs-on: xcode-27
     timeout-minutes: 60
+    defaults:
+      run:
+        # An explicit `shell: bash` runs with `-eo pipefail`; the implicit
+        # default is `bash -e` only, which let `nix build ... | tee` pass
+        # with tee's exit status when the build itself failed.
+        shell: bash
     env:
       # Pinned rather than the image default (/Applications/Xcode.app), so an
       # image update that moves the default to a newer Xcode can't silently

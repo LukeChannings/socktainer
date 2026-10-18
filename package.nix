@@ -93,6 +93,13 @@ stdenvNoCC.mkDerivation {
 
     swift_args=(
       -c release
+      # SwiftPM wraps manifest compilation (and plugins) in its own macOS
+      # `sandbox-exec` profile. With `sandbox = relaxed`, Nix still runs this
+      # builder under a (permissive) sandbox profile despite `__noChroot`, and
+      # macOS refuses to apply a second one: the build dies with
+      # "sandbox-exec: sandbox_apply: Operation not permitted" while compiling
+      # Package.swift. The Nix build is already the isolation boundary.
+      --disable-sandbox
       --scratch-path "$TMPDIR/spm-scratch"
       --cache-path "$HOME/Library/Caches/org.swift.swiftpm"
       --config-path "$HOME/Library/org.swift.swiftpm/configuration"
