@@ -1,0 +1,113 @@
+# socktainer Nix build gate + binary cache push.
+#
+# This is OUR workflow (the LukeChannings fork's); the sibling workflows in
+# this directory are inherited from upstream socktainer/socktainer.
+#
+# What it does:
+#   * PRs + pushes to main: build the flake's `socktainer` package — the
+#     same derivation consumers get from `packages.aarch64-darwin.socktainer`
+#     / `overlays.default` — and smoke-test the binary.
+#   * Then pushes the built store path to the niks3 binary cache at
+#     https://nix.channings.me so consumers (hartlandia) substitute instead of
+#     rebuilding. The closure is just the binary: package.nix fails the build
+#     if it picks up any /nix/store runtime dependency.
+#
+# Why a macOS runner with Xcode: socktainer links Apple's Containerization
+# frameworks, so package.nix is an impure derivation (`__noChroot = true`)
+# that shells out to the host's `/usr/bin/xcrun swift build`. That needs:
+#   * `sandbox = relaxed`, so the daemon honours `__noChroot`;
+#   * Xcode selected system-wide with `xcode-select`. Builds run as the
+#     daemon's `_nixbld` users, so a job-level DEVELOPER_DIR never reaches
+#     them.
+# Runner image (preview), see images/macos/xcode-27-arm64-Readme.md in
+# https://github.com/actions/runner-images
+#
+# Secrets:
+#   NIKS3_AUTH_TOKEN — upload token for nix.channings.me (niks3 signs
+#   server-side; no client signing key needed).
+---
+name: nix
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build socktainer
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      # Pinned rather than the image default (/Applications/Xcode.app), so an
+      # image update that moves the default to a newer Xcode can't silently
+      # change the toolchain that built a cached path. Bump deliberately.
+      XCODE_APP: /Applications/Xcode_27.app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes back to the repo; don't leave the token on disk.
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select --switch "$XCODE_APP/Contents/Developer"
+          xcodebuild -version
+          xcrun swift --version
+
+      # Unwrappable: a SHA pin (with Dependabot's version comment) and a
+      # cache public key inside a block scalar.
+      # yamllint disable rule:line-length
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        with:
+          # Upstream Nix, as in the NixOS fork's workflow — not Determinate
+          # Nix, which would also try to log in to FlakeHub.
+          determinate: false
+          extra-conf: |
+            sandbox = relaxed
+            extra-substituters = https://nix.channings.me
+            extra-trusted-public-keys = garage:JZet/fsItH8cJ6SKLci1+BuMIQGDfZSa/8GxGpKcxss=
+      # yamllint enable rule:line-length
+
+      - name: Build socktainer
+        # The store path lands in $RUNNER_TEMP/socktainer-paths for the push
+        # step. A cache hit substitutes it instead of rebuilding.
+        run: |
+          nix build --print-build-logs --no-link --print-out-paths \
+            .#packages.aarch64-darwin.socktainer \
+            | tee "$RUNNER_TEMP/socktainer-paths"
+
+      - name: Smoke test
+        run: |
+          out="$(head -n 1 "$RUNNER_TEMP/socktainer-paths")"
+          "$out/bin/socktainer" --version
+          /usr/bin/otool -L "$out/bin/socktainer"
+
+      - name: Push to cache
+        # Pushes on PRs too (same-repo branches only — fork PRs get no
+        # secrets), so a branch's build is cached before it merges. niks3
+        # walks and uploads the full closure of the given paths.
+        if: >-
+          ${{ github.event.pull_request.head.repo.full_name == github.repository
+          || github.event_name == 'push' }}
+        env:
+          # niks3 wants the token in a file (--auth-token-path); passing it on
+          # the command line is deprecated.
+          NIKS3_AUTH_TOKEN: ${{ secrets.NIKS3_AUTH_TOKEN }}
+        run: |
+          token_file="$(mktemp)"
+          trap 'rm -f "$token_file"' EXIT
+          printf '%s' "$NIKS3_AUTH_TOKEN" > "$token_file"
+          mapfile -t paths < "$RUNNER_TEMP/socktainer-paths"
+          nix run github:Mic92/niks3 -- push \
+            --server-url https://nix.channings.me \
+            --auth-token-path "$token_file" \
+            "${paths[@]}"
