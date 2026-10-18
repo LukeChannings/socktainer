@@ -52,7 +52,11 @@
 
           checks.formatting = treefmt.config.build.check inputs.self;
 
-          devShells.default = pkgs.mkShell {
+          # mkShellNoCC: the Swift toolchain and macOS SDK come from Xcode, not
+          # nixpkgs. A plain mkShell would pull in the Darwin stdenv, whose
+          # apple-sdk hook points DEVELOPER_DIR/SDKROOT at nixpkgs' (older) SDK
+          # and puts xcbuild's xcrun shim on PATH.
+          devShells.default = pkgs.mkShellNoCC {
             packages = with pkgs; [
               git
               gnumake
@@ -60,9 +64,44 @@
               treefmt.config.build.wrapper
             ];
 
+            # Use Xcode's toolchain for this shell only (DEVELOPER_DIR is read
+            # by the /usr/bin/swift and xcrun shims), without touching the
+            # system-wide `xcode-select`. The CommandLineTools driver doesn't
+            # search the plugins/testing directory, so swift-testing macros
+            # (#expect, @Test) fail to expand and `make test` breaks there.
+            #
+            # Precedence: a DEVELOPER_DIR you already exported (unless it is a
+            # Nix store or CommandLineTools path), then the `xcode-select`
+            # choice if it is an Xcode, then /Applications/Xcode.app.
             shellHook = ''
+              socktainer_is_xcode() {
+                case "$1" in
+                  "" | /nix/store/* | */CommandLineTools | */CommandLineTools/) return 1 ;;
+                  *) [ -x "$1/usr/bin/xcodebuild" ] ;;
+                esac
+              }
+
+              socktainer_dev_dir=""
+              if socktainer_is_xcode "''${DEVELOPER_DIR:-}"; then
+                socktainer_dev_dir="$DEVELOPER_DIR"
+              elif socktainer_is_xcode "$(/usr/bin/xcode-select -p 2>/dev/null)"; then
+                socktainer_dev_dir="$(/usr/bin/xcode-select -p)"
+              elif socktainer_is_xcode /Applications/Xcode.app/Contents/Developer; then
+                socktainer_dev_dir=/Applications/Xcode.app/Contents/Developer
+              fi
+
+              if [ -n "$socktainer_dev_dir" ]; then
+                export DEVELOPER_DIR="$socktainer_dev_dir"
+              else
+                unset DEVELOPER_DIR
+                echo "warning: no Xcode found; using CommandLineTools. 'make test' will fail to expand" \
+                  "swift-testing macros. Install Xcode or export DEVELOPER_DIR=<Xcode>/Contents/Developer." >&2
+              fi
+              unset socktainer_dev_dir
+              unset -f socktainer_is_xcode
+
               if ! command -v swift >/dev/null 2>&1; then
-                echo "warning: 'swift' not on PATH — install Xcode 16.x or the Swift.org 6.2 toolchain." >&2
+                echo "warning: 'swift' not on PATH — install Xcode." >&2
               fi
             '';
           };
