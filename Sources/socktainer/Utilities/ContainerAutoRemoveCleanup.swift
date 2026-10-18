@@ -1,4 +1,5 @@
 import Foundation
+import Logging
 
 /// Performs the full `--rm` cleanup once `ContainerInfoCache.consumeAutoRemove` grants it:
 /// DNS alias unregistration, the `destroy` event, and clearing the cache entry. Shared by the
@@ -12,10 +13,16 @@ enum ContainerAutoRemoveCleanup {
         fallbackImage: String,
         fallbackLabels: [String: String],
         dnsServer: SocktainerDNSServer?,
-        broadcaster: EventBroadcaster?
+        broadcaster: EventBroadcaster?,
+        removeVolumes: @Sendable ([String]) async -> Void = { names in
+            await ContainerAnonymousVolumes.remove(names: names, logger: Logger(label: "socktainer.autoremove"), retries: 30)
+        }
     ) async {
         let cached = await ContainerInfoCache.shared.get(id: hexId)
         let labels = cached?.labels ?? fallbackLabels
+
+        await removeVolumes(ContainerAnonymousVolumes.names(labels: labels))
+        ExtraHostsFile.remove(labels: labels)
 
         if let dnsServer {
             ContainerAliasCleanup.unregisterAllAliases(
@@ -36,5 +43,9 @@ enum ContainerAutoRemoveCleanup {
         }
         await ContainerInfoCache.shared.remove(id: hexId)
         await RestartPolicyOverrideStore.shared.remove(id: hexId)
+        // `--rm` containers are reaped here instead of through DELETE, so this is where their
+        // die-event bookkeeping is released. It also refuses later claims: a second observer
+        // still resolving the same exit would otherwise find no record and emit another `die`.
+        await DieEventOwnership.shared.forget(id: cached?.nativeId ?? nativeId)
     }
 }

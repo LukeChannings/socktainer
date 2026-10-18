@@ -88,6 +88,20 @@ extension ContainerAttachRoute {
         }
     }
 
+    /// Preparation can recreate the container, or wait while another request
+    /// starts it. Select the attach path using the fresh state in either case.
+    static func preparedContainer(id: String, client: ClientContainerProtocol) async throws -> ContainerSnapshot {
+        guard let container = try await client.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+        guard container.status == .stopped else { return container }
+        try await client.prepareForStart(container: container)
+        guard let prepared = try await client.getContainer(id: id) else {
+            throw Abort(.notFound, reason: "No such container: \(id)")
+        }
+        return prepared
+    }
+
     private static func handleAttachRequest(req: Request, client: ClientContainerProtocol) async throws -> Response {
         guard let id = req.parameters.get("id") else {
             throw Abort(.badRequest, reason: "Missing container ID")
@@ -114,9 +128,7 @@ extension ContainerAttachRoute {
             throw Abort(.badRequest, reason: "At least one of stdout or stderr must be true")
         }
 
-        guard let container = try await client.getContainer(id: id) else {
-            throw Abort(.notFound, reason: "No such container: \(id)")
-        }
+        let container = try await preparedContainer(id: id, client: client)
 
         // hijack connection
         let isUpgrade = req.headers.contains(where: { $0.name.lowercased() == "upgrade" && $0.value.lowercased() == "tcp" })
@@ -322,6 +334,7 @@ extension ContainerAttachRoute {
         }
 
         do {
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
         } catch {
             if !isBenignStartRace(error) {
@@ -330,6 +343,10 @@ extension ContainerAttachRoute {
                 throw Abort(.internalServerError, reason: "Failed to start container: \(error.localizedDescription)")
             }
         }
+
+        // The container is executing now: open a run so this exit's `die` is claimable.
+        // `docker compose up` starts a service entirely through this path, never `POST /start`.
+        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
@@ -366,7 +383,8 @@ extension ContainerAttachRoute {
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                            broadcaster: req.application.storage[EventBroadcasterKey.self],
+                            runEpoch: runEpoch
                         )
                     }
 
@@ -419,7 +437,9 @@ extension ContainerAttachRoute {
         let shouldUpgrade = connectionHeader?.contains("upgrade") == true && upgradeHeader == "tcp"
 
         guard let currentContainer = try await client.getContainer(id: container.id) else {
-            throw Abort(.notFound, reason: "Container not found")
+            // Docker phrasing ("No such container: <id>") is load-bearing — see the
+            // matching comment in ContainerInspectRoute.
+            throw Abort(.notFound, reason: "No such container: \(container.id)")
         }
 
         // NOTE: For true docker run -it behavior, we need to control the main process stdio,
@@ -483,6 +503,7 @@ extension ContainerAttachRoute {
         }
 
         do {
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
         } catch {
             pipes.closeAfterHandoff()
@@ -492,6 +513,9 @@ extension ContainerAttachRoute {
             await ContainerExitCodeStore.shared.set(id: container.id, code: -1)
             throw Abort(.internalServerError, reason: "Failed to start main process: \(error.localizedDescription)")
         }
+
+        // Executing now: open a run so this exit's `die` is claimable exactly once.
+        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
@@ -527,7 +551,8 @@ extension ContainerAttachRoute {
                             fallbackImage: container.configuration.image.reference,
                             fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                             dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                            broadcaster: req.application.storage[EventBroadcasterKey.self]
+                            broadcaster: req.application.storage[EventBroadcasterKey.self],
+                            runEpoch: runEpoch
                         )
                     }
 
@@ -776,7 +801,8 @@ extension ContainerAttachRoute {
                         fallbackImage: container.configuration.image.reference,
                         fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                         dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                        broadcaster: req.application.storage[EventBroadcasterKey.self]
+                        broadcaster: req.application.storage[EventBroadcasterKey.self],
+                        runEpoch: runEpoch
                     )
 
                     // DockerTCPHandler owns pipes.stdin!.write after setStdinWriter(); it closes

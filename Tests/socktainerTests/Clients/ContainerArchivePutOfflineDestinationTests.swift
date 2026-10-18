@@ -45,9 +45,12 @@ struct ContainerArchivePutOfflineDestinationTests {
             }
         }
 
-        // The offline unpack must not have created the missing directory.
-        let reader = try EXT4.EXT4Reader(blockDevice: FilePath(fixture.rootfs.path))
-        #expect(!reader.exists(FilePath("/completely")), "the missing destination must not be auto-created on rejection")
+        // The destination is validated against the image snapshot before
+        // anything is written: a rejected PUT on a never-started container
+        // must neither provision a rootfs nor auto-create the missing directory.
+        #expect(
+            !FileManager.default.fileExists(atPath: fixture.rootfs.path),
+            "a rejected PUT must not materialise the container's rootfs")
     }
 
     @Test("PUT to `/` still returns success (regression guard against over-tightening)")
@@ -176,7 +179,7 @@ private struct OfflineDestinationFixture {
         )
         let image = ImageDescription(
             reference: "alpine:latest",
-            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:" + String(repeating: "a", count: 64), size: 0)
         )
         let config = ContainerConfiguration(id: id, image: image, process: proc)
 

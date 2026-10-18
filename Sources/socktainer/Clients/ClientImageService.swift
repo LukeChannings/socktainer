@@ -58,6 +58,8 @@ extension ClientImageProtocol {
 enum ClientImageError: Error {
     case notFound(id: String)
     case digestReferenceNotAllowed(repo: String)
+    /// Deleting by image ID while several references still point at the image.
+    case conflict(id: String)
 }
 
 enum PullProgress: Sendable {
@@ -103,8 +105,9 @@ actor PullByteCounter {
 /// Seam that abstracts the static `ClientImage` API for testing.
 /// The real implementation delegates to Apple Container; tests inject a fake.
 protocol ImageDeletionStore: Sendable {
-    /// Return the (normalizedReference, digest) for the image matching `id`.
-    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String)
+    /// Return the normalized reference and digest for the image matching `id`, and whether
+    /// `id` matched as an image ID rather than as a reference.
+    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (reference: String, digest: String, byID: Bool)
     /// Return all normalized references that share the same digest.
     /// Call this AFTER delete() to determine whether the deletion freed the image layers.
     func refsForDigest(_ digest: String) async throws -> [String]
@@ -118,9 +121,9 @@ protocol ImageDeletionStore: Sendable {
 
 /// Production implementation — delegates straight to Apple Container.
 struct LiveImageDeletionStore: ImageDeletionStore {
-    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (String, String) {
-        let image = try await ClientImage.get(reference: id, containerSystemConfig: config)
-        return (image.reference, image.digest)
+    func normalizedReference(for id: String, config: ContainerSystemConfig) async throws -> (reference: String, digest: String, byID: Bool) {
+        let resolved = try await ImageIDResolver.resolve(id, containerSystemConfig: config)
+        return (resolved.image.reference, resolved.image.digest, resolved.byID)
     }
 
     func refsForDigest(_ digest: String) async throws -> [String] {
@@ -223,10 +226,16 @@ struct ClientImageService: ClientImageProtocol {
     ) async throws -> ImageDeletionResult {
         let normalizedRef: String
         let digest: String
+        let byID: Bool
         do {
-            (normalizedRef, digest) = try await imageStore.normalizedReference(for: id, config: containerSystemConfig)
+            (normalizedRef, digest, byID) = try await imageStore.normalizedReference(for: id, config: containerSystemConfig)
         } catch {
             throw ClientImageError.notFound(id: id)
+        }
+        // Like moby, an ID names the image itself: refuse to drop just one of its references.
+        // A failed lookup must not be read as "single reference", so it propagates.
+        if byID, try await imageStore.refsForDigest(digest).count > 1 {
+            throw ClientImageError.conflict(id: id)
         }
         try await imageStore.delete(reference: normalizedRef)
 
@@ -269,6 +278,8 @@ struct ClientImageService: ClientImageProtocol {
 
         logger.info("Pulling image reference: \(reference)")
 
+        let scheme = RegistryScheme.scheme(forReference: reference, internalDnsDomain: containerSystemConfig.dns.domain)
+
         return AsyncThrowingStream { continuation in
             logger.info("Starting to pull image \(reference) for platform \(platform.description)")
             continuation.yield(.message("Trying to pull \(reference)"))
@@ -278,6 +289,7 @@ struct ClientImageService: ClientImageProtocol {
                     let image = try await ClientImage.pull(
                         reference: reference,
                         platform: platform,
+                        scheme: scheme,
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
@@ -307,6 +319,7 @@ struct ClientImageService: ClientImageProtocol {
                     )
                     logger.info("Successfully pulled image \(reference) for platform \(platform.description)")
                     continuation.yield(.message("Image digest: \(image.digest)"))
+                    continuation.yield(.message(ClientImageService.pulledStatusMessage(for: reference)))
                     continuation.finish()
                 } catch {
                     // On arm64 hosts: if the image has no arm64 variant, fall back to amd64 (Rosetta).
@@ -322,12 +335,14 @@ struct ClientImageService: ClientImageProtocol {
                             let fallbackImage = try await ClientImage.pull(
                                 reference: reference,
                                 platform: amd64,
+                                scheme: scheme,
                                 containerSystemConfig: containerSystemConfig,
                                 progressUpdate: nil
                             )
                             try await fallbackImage.unpack(platform: amd64, progressUpdate: nil)
                             logger.info("Successfully pulled \(reference) for amd64 (Rosetta)")
                             continuation.yield(.message("Image digest: \(fallbackImage.digest)"))
+                            continuation.yield(.message(ClientImageService.pulledStatusMessage(for: reference)))
                             continuation.finish()
                         } catch let fallbackError {
                             logger.error("amd64 fallback also failed for \(reference): \(fallbackError)")
@@ -370,7 +385,7 @@ struct ClientImageService: ClientImageProtocol {
                 do {
                     try await image.push(
                         platform: effectivePlatform,
-                        scheme: .auto,
+                        scheme: RegistryScheme.scheme(forReference: normalizedReference, internalDnsDomain: containerSystemConfig.dns.domain),
                         containerSystemConfig: containerSystemConfig,
                         progressUpdate: { progressEvents in
                             for event in progressEvents {
@@ -817,5 +832,15 @@ struct ClientImageService: ClientImageProtocol {
         } catch {
             return .malformed(reason: String(describing: error))
         }
+    }
+
+    /// docker-java's `PullImageResultCallback.checkDockerClientPullSuccessful` only accepts
+    /// a stream ending in one of a handful of exact terminal phrases; the real Docker daemon
+    /// always emits one, but `pull()`'s prior last line ("Image digest: …") matches none of
+    /// them, so every pull under Testcontainers/docker-java failed even though the image was
+    /// fetched correctly (issue #359). `pull()` doesn't distinguish a fresh fetch from an
+    /// already-cached image, so this is used unconditionally — docker-java accepts it either way.
+    static func pulledStatusMessage(for reference: String) -> String {
+        "Status: Downloaded newer image for \(reference)"
     }
 }

@@ -170,24 +170,55 @@ struct SocktainerDNSServerTests {
 
 // MARK: - DNS query behaviour
 
-/// Sends a minimal DNS A or AAAA query via UDP and returns the RCODE from the response.
-/// Retries up to 5 times with 50 ms gaps to handle the race between Thread.detachNewThread
-/// and the server loop reaching recvfrom(). Returns nil only if all attempts time out.
-private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
-    var qname = [UInt8]()
-    for label in name.split(separator: ".") {
-        let bytes = Array(label.utf8)
-        qname.append(UInt8(bytes.count))
-        qname.append(contentsOf: bytes)
+/// Sends a minimal DNS query (one question per `names` entry) via UDP and returns the RCODE.
+private func dnsRcode(type: UInt16, names: [String], port: Int) -> UInt8? {
+    guard
+        let response = sendDnsQuery(makeDnsQuery(names: names, type: type, edns0: false), port: port),
+        response.count >= 4
+    else { return nil }
+    return response[3] & 0x0F
+}
+
+/// Builds a DNS query packet (ID 0x1234, RD=1): one question per `names` entry
+/// (QDCOUNT = names.count), optionally with an EDNS0 OPT additional record
+/// (ARCOUNT=1, UDP payload 4096) like real resolvers send.
+private func makeDnsQuery(names: [String], type: UInt16, edns0: Bool) -> [UInt8] {
+    func qnameBytes(_ name: String) -> [UInt8] {
+        var qname = [UInt8]()
+        for label in name.split(separator: ".") {
+            let bytes = Array(label.utf8)
+            qname.append(UInt8(bytes.count))
+            qname.append(contentsOf: bytes)
+        }
+        qname.append(0)
+        return qname
     }
-    qname.append(0)
 
     var packet = [UInt8]()
     packet += [0x12, 0x34, 0x01, 0x00]  // ID + RD=1 query
-    packet += [0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]  // QDCOUNT=1, rest 0
-    packet += qname
-    packet += [UInt8(type >> 8), UInt8(type & 0xFF), 0x00, 0x01]  // QTYPE + QCLASS IN
+    packet += [UInt8(names.count >> 8), UInt8(names.count & 0xFF)]  // QDCOUNT
+    packet += [0x00, 0x00]  // ANCOUNT=0
+    packet += [0x00, 0x00]  // NSCOUNT=0
+    if edns0 {
+        packet += [0x00, 0x01]  // ARCOUNT=1
+    } else {
+        packet += [0x00, 0x00]  // ARCOUNT=0
+    }
+    for name in names {
+        packet += qnameBytes(name)
+        packet += [UInt8(type >> 8), UInt8(type & 0xFF), 0x00, 0x01]  // QTYPE + QCLASS IN
+    }
+    if edns0 {
+        // EDNS0 OPT record: root name, TYPE=41, CLASS=4096 (UDP payload), TTL=0, RDLEN=0
+        packet += [0x00, 0x00, 0x29, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    }
+    return packet
+}
 
+/// Sends raw query bytes via UDP to 127.0.0.1:port and returns the raw response.
+/// Retries up to 5 times with 50 ms gaps to handle the race between Thread.detachNewThread
+/// and the server loop reaching recvfrom(). Returns nil only if all attempts time out.
+private func sendDnsQuery(_ packet: [UInt8], port: Int) -> [UInt8]? {
     var dst = sockaddr_in()
     dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     dst.sin_family = sa_family_t(AF_INET)
@@ -211,9 +242,55 @@ private func dnsRcode(type: UInt16, name: String, port: Int) -> UInt8? {
         guard sent > 0 else { continue }
         var buf = [UInt8](repeating: 0, count: 512)
         let n = recv(fd, &buf, buf.count, 0)
-        if n >= 4 { return buf[3] & 0x0F }
+        if n >= 12 { return Array(buf[0..<n]) }
     }
     return nil
+}
+
+/// Sends an EDNS0-OPT query and returns the response's ARCOUNT, the first A answer's IP,
+/// and the bytes remaining after the question and answer sections. ARCOUNT and remaining
+/// are 0 for a well-formed response — an echoed OPT record or trailing bytes would make
+/// them nonzero.
+private func dnsResponseTail(type: UInt16, names: [String], port: Int) -> (arcount: Int, ip: String, remaining: Int)? {
+    guard
+        let response = sendDnsQuery(makeDnsQuery(names: names, type: type, edns0: true), port: port),
+        response.count >= 12
+    else { return nil }
+    let qd = Int((UInt16(response[4]) << 8) | UInt16(response[5]))
+    let an = Int((UInt16(response[6]) << 8) | UInt16(response[7]))
+    let arcount = Int((UInt16(response[10]) << 8) | UInt16(response[11]))
+    var pos = 12
+    var ip = ""
+    func skipName() {
+        while pos < response.count {
+            let len = Int(response[pos])
+            pos += 1
+            if len == 0 { break }
+            if (len & 0xC0) == 0xC0 {
+                pos += 1
+                break
+            }  // compression pointer (2 bytes total)
+            pos += len
+        }
+    }
+    for _ in 0..<qd {
+        skipName()
+        pos += 4
+    }
+    for _ in 0..<an {
+        skipName()
+        guard pos + 10 <= response.count else { break }
+        let answerType = Int((UInt16(response[pos]) << 8) | UInt16(response[pos + 1]))
+        let rdlen = Int((UInt16(response[pos + 8]) << 8) | UInt16(response[pos + 9]))
+        pos += 10
+        // Capture the first A record's rdata; skip AAAA and other types.
+        if answerType == 1 && rdlen == 4 && ip.count == 0 {
+            guard pos + 4 <= response.count else { break }
+            ip = response[pos..<pos + rdlen].map(String.init).joined(separator: ".")
+        }
+        pos += rdlen
+    }
+    return (arcount, ip, response.count - pos)
 }
 
 @Suite("SocktainerDNSServer — query behaviour")
@@ -227,7 +304,7 @@ struct SocktainerDNSQueryTests {
             return
         }
         server.register(hostname: "supabase_db_supabase", ip: "192.168.67.3")
-        let rcode = dnsRcode(type: 1, name: "supabase_db_supabase", port: port)
+        let rcode = dnsRcode(type: 1, names: ["supabase_db_supabase"], port: port)
         #expect(rcode == 0, "A for known name must succeed (RCODE=0)")
     }
 
@@ -240,8 +317,8 @@ struct SocktainerDNSQueryTests {
         }
         // Warmup: register a dummy entry — the lock acquisition gives the server thread time to start.
         server.register(hostname: "_warmup", ip: "127.0.0.1")
-        let rcode = dnsRcode(type: 1, name: "no-such-container", port: port)
-        #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding to 1.1.1.1")
+        let rcode = dnsRcode(type: 1, names: ["no-such-container"], port: port)
+        #expect(rcode == 3, "A for unknown single-label name must return NXDOMAIN without forwarding upstream")
     }
 
     @Test("AAAA query for single-label name returns NODATA (RCODE 0, no answers)")
@@ -253,8 +330,8 @@ struct SocktainerDNSQueryTests {
         }
         server.register(hostname: "db", ip: "192.168.67.3")
         // NODATA is RCODE=0 with zero answer records; the test checks RCODE only.
-        let rcode = dnsRcode(type: 28, name: "db", port: port)
-        #expect(rcode == 0, "AAAA for single-label name must return NODATA (RCODE=0), not NXDOMAIN from 1.1.1.1")
+        let rcode = dnsRcode(type: 28, names: ["db"], port: port)
+        #expect(rcode == 0, "AAAA for single-label name must return NODATA (RCODE=0), not an upstream NXDOMAIN")
     }
 
     @Test("AAAA query for unknown single-label name returns NODATA (RCODE 0)")
@@ -265,8 +342,204 @@ struct SocktainerDNSQueryTests {
             return
         }
         server.register(hostname: "_warmup", ip: "127.0.0.1")
-        let rcode = dnsRcode(type: 28, name: "unknown-svc", port: port)
-        #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward to 1.1.1.1")
+        let rcode = dnsRcode(type: 28, names: ["unknown-svc"], port: port)
+        #expect(rcode == 0, "AAAA for unknown single-label name must return NODATA, never forward upstream")
+    }
+
+    @Test("Multi-label query is forwarded to the configured upstream, not 1.1.1.1 (#410)")
+    func multiLabelQueryForwardsToConfiguredUpstream() throws {
+        // Stub upstream on loopback: answers every query with RCODE=5 (REFUSED), a code
+        // neither 1.1.1.1 nor the local fast path would return for this name.
+        let stub = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+        try #require(stub >= 0)
+        defer { Darwin.close(stub) }
+        var tv = timeval(tv_sec: 2, tv_usec: 0)  // lets the stub thread exit after the test
+        setsockopt(stub, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_in()
+        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr)
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(stub, $0, len) == 0 && getsockname(stub, $0, &len) == 0 }
+        }
+        try #require(bound)
+        let stubPort = Int(UInt16(bigEndian: addr.sin_port))
+        let stubThread = Thread {
+            var buf = [UInt8](repeating: 0, count: 512)
+            var from = sockaddr_in()
+            var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            while true {
+                let n = withUnsafeMutablePointer(to: &from) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { recvfrom(stub, &buf, buf.count, 0, $0, &fromLen) }
+                }
+                guard n >= 12 else { return }
+                buf[2] |= 0x80  // QR=1
+                buf[3] = (buf[3] & 0xF0) | 0x05  // RCODE=5
+                _ = withUnsafePointer(to: &from) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(stub, buf, n, 0, $0, fromLen) }
+                }
+            }
+        }
+        stubThread.start()
+
+        let server = SocktainerDNSServer()
+        server.upstreamHost = "127.0.0.1"
+        server.upstreamPort = stubPort
+        guard let port = server.start(preferredPort: 19780, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        let rcode = dnsRcode(type: 1, names: ["host.internal.example"], port: port)
+        #expect(rcode == 5, "multi-label name must be answered by the configured upstream")
+    }
+
+    @Test("Query with QDCOUNT > 1 returns FORMERR (RCODE 1)")
+    func qdcountGreaterThanOneReturnsFormerr() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19770, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+
+        // Two questions in one query — RFC 9619: must be refused with FORMERR.
+        let rcode = dnsRcode(type: 1, names: ["redis", "db"], port: port)
+        #expect(rcode == 1, "QDCOUNT > 1 must be answered with FORMERR (RCODE=1)")
+    }
+
+    // Regression: NS & AR sections should be dropped when their count is set to 0.
+    @Test("A query with EDNS0 OPT for a registered name returns a well-formed response")
+    func aQueryWithOPTForRegisteredNameReturnsWellFormedResponse() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19740, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "redis", ip: "192.168.1.10")
+
+        guard let tail = dnsResponseTail(type: 1, names: ["redis"], port: port) else {
+            Issue.record("No response for EDNS0 A query")
+            return
+        }
+        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.ip == "192.168.1.10", "response must return the correct ip in the answer section")
+        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
+    }
+
+    @Test("AAAA query with EDNS0 OPT for a single-label name returns a well-formed NODATA")
+    func aaaaQueryWithOPTForSingleLabelReturnsWellFormedNodata() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19750, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "db", ip: "192.168.67.3")
+
+        guard let tail = dnsResponseTail(type: 28, names: ["db"], port: port) else {
+            Issue.record("No response for EDNS0 AAAA query")
+            return
+        }
+        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
+    }
+
+    @Test("A query with EDNS0 OPT for an unknown single-label name returns a well-formed NXDOMAIN")
+    func aQueryWithOPTForUnknownSingleLabelReturnsWellFormedNxdomain() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19760, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+
+        guard let tail = dnsResponseTail(type: 1, names: ["no-such-container"], port: port) else {
+            Issue.record("No response for EDNS0 A query")
+            return
+        }
+        #expect(tail.arcount == 0, "response must not echo the query's OPT record")
+        #expect(tail.remaining == 0, "no bytes may remain after the question and answer sections")
+    }
+}
+
+// MARK: - Multi-homed hostname resolution
+//
+// A container on two networks is registered once per network. Every network's forwarder
+// sidecar relays to the same server, so the answer must be the address on the network
+// the query came from, which the querying peer can reach.
+
+@Suite("SocktainerDNSServer — multi-homed hostname resolution")
+struct SocktainerDNSMultiHomedTests {
+
+    @Test("Returns the address on the querying client's subnet")
+    func lookupAddressPrefersQueryingClientsSubnet() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 5])
+    }
+
+    @Test("Registering a second network for a hostname does not evict the first")
+    func registeringSecondNetworkKeepsFirst() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ip: "192.168.10.5/24")
+        server.register(hostname: "web", ip: "192.168.20.7/24")
+
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 5])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7])
+    }
+
+    @Test("Re-registering on one subnet replaces only that subnet's entry")
+    func reregisteringSameSubnetOverwritesInPlace() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+        server.register(hostname: "web", ip: "192.168.10.55/24")
+
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 10, 55])
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 20, 42]) == [192, 168, 20, 7], "netB's entry must be untouched")
+    }
+
+    @Test("Falls back to the first-registered address when no subnet matches")
+    func fallsBackToFirstRegisteredAddressWhenNoSubnetMatches() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+
+        #expect(server.lookupAddress("web", clientIP: [10, 0, 0, 1]) == [192, 168, 10, 5])
+        #expect(server.listEntries()["web"] == "192.168.10.5")
+    }
+
+    @Test("unregisterIfOwned with the first address removes every address of that container")
+    func unregisterIfOwnedRemovesAllOfOwnersAddresses() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24", "192.168.20.7/24"])
+        server.unregisterIfOwned(hostname: "web", expectedIP: "192.168.10.5")
+        #expect(server.listEntries()["web"] == nil, "no address on the second network may be left behind")
+    }
+
+    @Test("unregisterIfOwned leaves another container's addresses under the same name")
+    func unregisterIfOwnedKeepsOtherOwners() {
+        let server = SocktainerDNSServer()
+        server.register(hostname: "web", ips: ["192.168.10.5/24"])
+        server.register(hostname: "web", ips: ["192.168.20.7/24"])
+        server.unregisterIfOwned(hostname: "web", expectedIP: "192.168.10.5")
+
+        #expect(server.listEntries()["web"] == "192.168.20.7")
+        #expect(server.lookupAddress("web", clientIP: [192, 168, 10, 99]) == [192, 168, 20, 7])
+    }
+
+    // The test client always sends from 127.0.0.1. The loopback entry is registered first
+    // for one name and last for the other, so neither first- nor last-registered wins both.
+    @Test("End-to-end: query is answered with the address on the client's subnet")
+    func endToEndAnswersFromMatchingSubnet() throws {
+        let server = SocktainerDNSServer()
+        guard let port = server.start(preferredPort: 19790, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        server.register(hostname: "web", ips: ["127.0.0.9/8", "10.99.0.7/24"])
+        server.register(hostname: "api", ips: ["10.99.0.8/24", "127.0.0.10/8"])
+
+        #expect(dnsResponseTail(type: 1, names: ["web"], port: port)?.ip == "127.0.0.9")
+        #expect(dnsResponseTail(type: 1, names: ["api"], port: port)?.ip == "127.0.0.10")
     }
 }
 
@@ -535,6 +808,44 @@ struct DNSAttachmentIPTests {
     }
 }
 
+// MARK: - ContainerStartRoute.dnsAttachmentCIDRs (every attachment a multi-homed container is registered on)
+
+@Suite("ContainerStartRoute.dnsAttachmentCIDRs")
+struct DNSAttachmentCIDRsTests {
+
+    @Test("A container on two named networks returns a CIDR for each")
+    func multiHomedContainerReturnsBothCIDRs() throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "netA", ip: "192.168.10.5"), (network: "netB", ip: "192.168.20.7")],
+            labels: [:]
+        )
+        let result = ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot)
+        #expect(result == ["192.168.10.5/24", "192.168.20.7/24"], "must carry a CIDR for every named-network attachment, not just the first")
+    }
+
+    @Test("Reserved attachments are excluded, named ones kept")
+    func reservedAttachmentsExcluded() throws {
+        let snapshot = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "bridge", ip: "192.168.65.10"), (network: "stackdemo_default", ip: "192.168.65.20")],
+            labels: [:]
+        )
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot) == ["192.168.65.20/24"])
+    }
+
+    @Test("Only reserved networks returns an empty list")
+    func onlyReservedNetworksReturnsEmpty() throws {
+        let snapshot = try makeContainerSnapshot(nativeId: "web-1", ip: "192.168.65.10", network: "bridge", labels: [:])
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: snapshot).isEmpty)
+    }
+
+    @Test("Nil snapshot returns an empty list")
+    func nilSnapshotReturnsEmpty() {
+        #expect(ContainerStartRoute.dnsAttachmentCIDRs(in: nil).isEmpty)
+    }
+}
+
 // MARK: - ContainerStartRoute.registerDNSAliasesOnResume (daemon-restart re-registration)
 
 @Suite("ContainerStartRoute.registerDNSAliasesOnResume")
@@ -580,5 +891,38 @@ struct RegisterDNSAliasesOnResumeTests {
         #expect(entries["pg"] == "192.168.65.20")
         #expect(entries["db"] == "192.168.65.20")
         #expect(entries["db.stackdemo"] == "192.168.65.20")
+    }
+
+    @Test("Re-registers a multi-homed container on every named network")
+    func reRegistersEveryNamedNetwork() throws {
+        let container = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "netA", ip: "192.168.10.5"), (network: "netB", ip: "192.168.20.7")],
+            labels: ["com.docker.compose.service": "web"]
+        )
+        let dnsServer = SocktainerDNSServer()
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+        #expect(dnsServer.lookupAddress("web", clientIP: [192, 168, 20, 2]) == [192, 168, 20, 7])
+        #expect(dnsServer.lookupAddress("web-1", clientIP: [192, 168, 10, 2]) == [192, 168, 10, 5])
+    }
+
+    // The test client always sends from 127.0.0.1, so it plays a peer that shares only the
+    // container's second network.
+    @Test("End-to-end: a peer on the second network gets the second network's address")
+    func endToEndPeerOnSecondNetworkGetsItsAddress() throws {
+        let container = try makeContainerSnapshot(
+            nativeId: "web-1",
+            networks: [(network: "netA", ip: "10.99.0.7"), (network: "netB", ip: "127.0.0.9")],
+            labels: ["com.docker.compose.service": "web"]
+        )
+        let dnsServer = SocktainerDNSServer()
+        guard let port = dnsServer.start(preferredPort: 19795, maxAttempts: 5) else {
+            Issue.record("Could not bind DNS server port")
+            return
+        }
+        ContainerStartRoute.registerDNSAliasesOnResume(container: container, dnsServer: dnsServer, logger: Logger(label: "test"))
+
+        #expect(dnsResponseTail(type: 1, names: ["web"], port: port)?.ip == "127.0.0.9")
+        #expect(dnsResponseTail(type: 1, names: ["web-1"], port: port)?.ip == "127.0.0.9")
     }
 }

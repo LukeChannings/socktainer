@@ -4,19 +4,22 @@ import Foundation
 enum AppleContainerTimestampResolver {
     static let legacyCreationTimestampLabel = "io.github.socktainer.creation-timestamp"
 
-    private static let appSupportURL = URL(
+    static let appSupportURL = URL(
         fileURLWithPath: "\(NSHomeDirectory())/Library/Application Support/com.apple.container"
     )
     private static let epoch = Date(timeIntervalSince1970: 0)
 
     static func containerCreationDate(_ container: ContainerSnapshot) -> Date? {
-        if let bundleCreationDate = creationDate(
-            at: appSupportURL.appendingPathComponent("containers").appendingPathComponent(container.id)
-        ) {
-            return bundleCreationDate
+        // The label first: the Docker-facing id is derived from this date, and
+        // a container rebuilt in place (see PreStartInjectionStore) gets a new
+        // directory, which would change the id under a client mid-call.
+        if let labelled = legacyLabelCreationDate(from: container.configuration.labels) {
+            return labelled
         }
 
-        return legacyLabelCreationDate(from: container.configuration.labels)
+        return creationDate(
+            at: appSupportURL.appendingPathComponent("containers").appendingPathComponent(container.id)
+        )
     }
 
     static func networkCreationDate(_ networkResource: NetworkResource) -> Date? {

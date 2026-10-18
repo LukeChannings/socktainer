@@ -1,6 +1,8 @@
 import ContainerAPIClient
+import ContainerResource
 import Foundation
 import Logging
+import Synchronization
 import Vapor
 
 struct HealthCheckManagerKey: StorageKey {
@@ -31,6 +33,7 @@ actor HealthCheckManager {
     static let defaultIntervalNs: UInt64 = 30 * 1_000_000_000
     static let defaultTimeoutNs: UInt64 = 30 * 1_000_000_000
     static let defaultRetries: Int = 3
+    static let defaultStartIntervalNs: UInt64 = 5 * 1_000_000_000
 
     // Lower bounds applied to the user-supplied values. The interval floor is
     // overridable so tests can drive the loop at sub-second cadence; the
@@ -143,9 +146,12 @@ actor HealthCheckManager {
         let timeoutNs = max(configTimeoutNs, Self.minimumTimeoutNs)
         let maxRetries = config.Retries ?? Self.defaultRetries
 
-        if startPeriodNs > 0 {
-            try? await Task.sleep(nanoseconds: startPeriodNs)
-        }
+        let configStartIntervalNs = config.StartInterval.map { UInt64(max($0, 0)) } ?? 0
+        let startIntervalNs = max(configStartIntervalNs > 0 ? configStartIntervalNs : Self.defaultStartIntervalNs, intervalFloorNs)
+
+        // Like Docker, probe every StartInterval during StartPeriod rather than waiting it out.
+        var startDeadline: Date? =
+            startPeriodNs > 0 ? Date().addingTimeInterval(Double(startPeriodNs) / 1_000_000_000) : nil
 
         var failingStreak = 0
 
@@ -165,17 +171,25 @@ actor HealthCheckManager {
                 Output: ""  // stdout capture from container VMs requires pipe infrastructure
             )
 
+            let inStartPeriod = startDeadline.map { start < $0 } ?? false  // classify by when the probe began
+
             if exitCode == 0 {
+                startDeadline = nil  // the first success ends the start period
                 failingStreak = 0
                 updateStatus(id: containerId, health: ContainerHealth(Status: "healthy", FailingStreak: 0, Log: []), logEntry: entry)
+            } else if inStartPeriod {
+                // Failures during the start period don't count toward Retries.
+                updateStatus(id: containerId, health: ContainerHealth(Status: "starting", FailingStreak: 0, Log: []), logEntry: entry)
             } else {
                 failingStreak += 1
-                let status = failingStreak >= maxRetries ? "unhealthy" : "starting"
+                // Below Retries, keep the current status: a healthy container stays healthy.
+                let status = failingStreak >= maxRetries ? "unhealthy" : (statuses[containerId]?.Status ?? "starting")
                 updateStatus(id: containerId, health: ContainerHealth(Status: status, FailingStreak: failingStreak, Log: []), logEntry: entry)
                 log.debug("[healthcheck] \(containerId) → \(status) (streak=\(failingStreak), exit=\(exitCode))")
             }
 
-            try? await Task.sleep(nanoseconds: intervalNs)
+            let stillStarting = startDeadline.map { Date() < $0 } ?? false
+            try? await Task.sleep(nanoseconds: stillStarting ? startIntervalNs : intervalNs)
         }
     }
 
@@ -187,26 +201,94 @@ actor HealthCheckManager {
 
     // MARK: - Default probe (real exec)
 
-    private enum ProbeOutcome {
-        case exited(Int32)
-        case timedOut
+    /// Builds the probe's process from the container's init process. Like Docker,
+    /// the probe keeps the container's configured user (as `docker exec` without
+    /// `-u` does): a root probe leaves root-owned files, such as a marker in sticky
+    /// `/tmp`, that the container's own user can then no longer remove.
+    static func probeProcessConfiguration(base: ProcessConfiguration, cmd: [String]) -> ProcessConfiguration {
+        var processConfig = base
+        processConfig.executable = cmd[0]
+        processConfig.arguments = Array(cmd.dropFirst())
+        processConfig.terminal = false
+        return processConfig
+    }
+
+    /// How long the health loop waits for `kill` at the probe deadline before moving on.
+    static let probeKillTimeout: Duration = .seconds(1)
+
+    /// Waits up to `timeoutNs` for the probe to exit, returning its exit code, or 1
+    /// after calling `kill` at the deadline. `wait` and `kill` are XPC calls that ignore
+    /// task cancellation, so they can't be raced in a task group, which waits for every
+    /// child before returning; they run under the startup housekeeping deadline instead.
+    static func waitForProbe(
+        timeoutNs: UInt64,
+        wait: @escaping @Sendable () async throws -> Int32,
+        kill: @escaping @Sendable () async -> Void
+    ) async -> Int32 {
+        let exitCode = ProbeExitCode()
+        let exited = await StartupHousekeeping.runBounded(timeout: .nanoseconds(timeoutNs)) {
+            let code = (try? await wait()) ?? 1
+            exitCode.value.withLock { $0 = code }
+        }
+        guard exited else {
+            _ = await StartupHousekeeping.runBounded(timeout: probeKillTimeout) { await kill() }
+            return 1
+        }
+        return exitCode.value.withLock { $0 }
+    }
+
+    private final class ProbeExitCode: Sendable {
+        let value = Mutex<Int32>(1)
+    }
+
+    /// Containers with a probe still running. A timed-out probe's kill can fail
+    /// (apple/container#1941), so a later probe for that container fails at once rather
+    /// than start another process beside it, until the first one exits.
+    final class ProbesInFlight: Sendable {
+        private let ids = Mutex<Set<String>>([])
+        func begin(_ id: String) -> Bool { ids.withLock { $0.insert(id).inserted } }
+        func end(_ id: String) { ids.withLock { _ = $0.remove(id) } }
+        func isRunning(_ id: String) -> Bool { ids.withLock { $0.contains(id) } }
+    }
+
+    static let probesInFlight = ProbesInFlight()
+
+    typealias StartedProbe = (wait: @Sendable () async throws -> Int32, kill: @Sendable () async -> Void)
+
+    /// Starts a probe with `start` and waits for it, or returns 1 without starting one
+    /// while the container's previous probe is still running.
+    static func runProbe(
+        containerId: String,
+        timeoutNs: UInt64,
+        inFlight: ProbesInFlight,
+        start: () async throws -> StartedProbe
+    ) async -> Int32 {
+        guard inFlight.begin(containerId) else { return 1 }
+        let probe: StartedProbe
+        do {
+            probe = try await start()
+        } catch {
+            inFlight.end(containerId)
+            return 1
+        }
+        return await waitForProbe(
+            timeoutNs: timeoutNs,
+            wait: {
+                defer { inFlight.end(containerId) }
+                return try await probe.wait()
+            },
+            kill: probe.kill
+        )
     }
 
     /// Runs `cmd` inside the container via `createProcess`, with a timeout race.
     /// Returns the exit code, or 1 on any failure.
     static let execProbe: HealthProbe = { containerId, cmd, timeoutNs in
-        do {
+        await runProbe(containerId: containerId, timeoutNs: timeoutNs, inFlight: probesInFlight) {
             let containerClient = ContainerClient()
-            guard let container = try? await containerClient.get(id: containerId) else { return 1 }
+            let container = try await containerClient.get(id: containerId)
 
-            var processConfig = container.configuration.initProcess
-            processConfig.executable = cmd[0]
-            processConfig.arguments = Array(cmd.dropFirst())
-            processConfig.terminal = false
-            // Healthchecks run as root to avoid permission issues for probes
-            // that need to bind sockets, read pidfiles, etc.
-            processConfig.user = .id(uid: 0, gid: 0)
-
+            let processConfig = probeProcessConfiguration(base: container.configuration.initProcess, cmd: cmd)
             let processId = "hc-\(UUID().uuidString.lowercased())"
             let process = try await containerClient.createProcess(
                 containerId: containerId,
@@ -215,26 +297,7 @@ actor HealthCheckManager {
                 stdio: [nil, nil, nil]
             )
             try await process.start()
-
-            let outcome: ProbeOutcome = try await withThrowingTaskGroup(of: ProbeOutcome.self) { group in
-                group.addTask { .exited(try await process.wait()) }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: timeoutNs)
-                    return .timedOut
-                }
-                let result = try await group.next() ?? .timedOut
-                group.cancelAll()
-                return result
-            }
-            switch outcome {
-            case .exited(let code):
-                return code
-            case .timedOut:
-                try? await process.kill(SIGTERM)
-                return 1
-            }
-        } catch {
-            return 1
+            return (wait: { try await process.wait() }, kill: { try? await process.kill(SIGTERM) })
         }
     }
 }

@@ -136,9 +136,9 @@ extension ImageInspectRoute {
                 throw Abort(.internalServerError, reason: "Apple Container application support URL is not configured")
             }
 
-            let image: ClientImage
+            let resolved: ImageIDResolver.Resolved
             do {
-                image = try await ClientImage.get(reference: refOrId, containerSystemConfig: systemConfig)
+                resolved = try await ImageIDResolver.resolve(refOrId, containerSystemConfig: systemConfig)
             } catch {
                 // Docker phrasing ("No such image: <ref>") is load-bearing: docker-py
                 // only maps a 404 to ImageNotFound when the message contains
@@ -146,6 +146,7 @@ extension ImageInspectRoute {
                 // triggers an auto-pull, e.g. MiniStack's Lambda RIE image) is skipped.
                 throw Abort(.notFound, reason: "No such image: \(refOrId)")
             }
+            let image = resolved.image
 
             let containers = includeManifests ? try await ContainerClient().list() : []
             let imageIndex = try await image.index()
@@ -248,24 +249,37 @@ extension ImageInspectRoute {
                 }
             }
 
+            // An ID naming one platform's config shows that variant unless a platform was requested.
             let selectedVariant =
-                if let requestedPlatform {
-                    variants.first(where: { $0.platform == requestedPlatform })
+                if let platform = requestedPlatform ?? resolved.platform {
+                    variants.first(where: { $0.platform == platform })
                 } else {
                     prioritizeVariants(variants).first
                 }
 
             if let selectedVariant {
                 let selectedManifest = try? await image.manifest(for: selectedVariant.platform)
+                let rawConfig = await ImageVolumeConfiguration.readForInspect(logger: req.logger) {
+                    try await ImageVolumeConfiguration.read(image: image, platform: selectedVariant.platform)
+                }
                 let imageConfig: ImageConfig? = selectedVariant.config.config.map { ociConfig in
                     ImageConfig(
                         User: ociConfig.user,
                         ExposedPorts: nil,
                         Env: ociConfig.env,
                         Cmd: ociConfig.cmd,
-                        Healthcheck: nil,
+                        Healthcheck: rawConfig?.Healthcheck.map {
+                            HealthConfig(
+                                Test: $0.Test,
+                                Interval: $0.Interval.map(Int64.init),
+                                Timeout: $0.Timeout.map(Int64.init),
+                                Retries: $0.Retries,
+                                StartPeriod: $0.StartPeriod.map(Int64.init),
+                                StartInterval: $0.StartInterval.map(Int64.init)
+                            )
+                        },
                         ArgsEscaped: nil,
-                        Volumes: nil,
+                        Volumes: rawConfig?.Volumes,
                         WorkingDir: ociConfig.workingDir,
                         Entrypoint: ociConfig.entrypoint,
                         OnBuild: nil,
@@ -292,8 +306,9 @@ extension ImageInspectRoute {
                         appSupportURL: appleContainerAppSupportUrl
                     ),
                     Manifests: includeManifests ? manifestSummaries : nil,
-                    RepoTags: [image.reference],
-                    RepoDigests: repoDigestReference(name: image.reference, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
+                    RepoTags: ImageListFilter.repoTags(for: image.reference),
+                    RepoDigests: ImageListFilter.repoTags(for: image.reference).isEmpty
+                        ? [] : repoDigestReference(name: image.reference, digest: selectedDescriptor?.digest).map { [$0] } ?? [],
                     Parent: "",
                     Comment: selectedVariant.config.history?.last?.comment ?? "",
                     Created: selectedVariant.config.created,

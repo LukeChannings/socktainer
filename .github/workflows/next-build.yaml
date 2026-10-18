@@ -42,7 +42,7 @@ jobs:
       releaseId: ${{ steps.create_release.outputs.id}}
 
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
          token: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
          fetch-depth: 0
@@ -75,7 +75,7 @@ jobs:
 
       - name: Create Release
         id: create_release
-        uses: ncipollo/release-action@bcfe5470707e8832e12347755757cec0eb3c22af # v1.18.0
+        uses: ncipollo/release-action@339a81892b84b4eeb0f6e744e4574d79d0d9b8dd # v1.21.0
         with:
           tag: ${{ steps.TAG_UTIL.outputs.githubTag }}
           name: ${{ steps.TAG_UTIL.outputs.githubTag }}
@@ -91,19 +91,19 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: socktainer/prereleases
           ref: ${{ needs.tag.outputs.githubTag}}
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build
           key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-spm-
 
-      - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -148,6 +148,7 @@ jobs:
         run: |
           cd ./.build/arm64-apple-macosx/release/
           zip -r socktainer.zip socktainer
+          zip -r socktainer.dSYM.zip socktainer.dSYM
 
       - name: Submit for notarization
         run: |
@@ -176,6 +177,7 @@ jobs:
         run: |
          gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer
          gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.zip
+         gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./.build/arm64-apple-macosx/release/socktainer.dSYM.zip
          gh release upload --repo socktainer/prereleases ${{ needs.tag.outputs.githubTag}} ./pkginstaller/out/socktainer-installer.pkg
         env:
           GITHUB_TOKEN: ${{ secrets.SOCKTAINER_BOT_TOKEN }}
@@ -202,7 +204,7 @@ jobs:
     name: Homebrew Tap
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: socktainer/homebrew-tap
           token: ${{ secrets.SOCKTAINER_BOT_TOKEN }}

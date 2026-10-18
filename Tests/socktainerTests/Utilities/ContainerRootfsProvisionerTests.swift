@@ -123,7 +123,7 @@ private struct ProvisionerFixture {
         )
         let image = ImageDescription(
             reference: "alpine:latest",
-            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:" + String(repeating: "a", count: 64), size: 0)
         )
         let config = ContainerConfiguration(id: id, image: image, process: proc)
 

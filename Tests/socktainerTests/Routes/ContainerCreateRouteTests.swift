@@ -149,6 +149,14 @@ struct LoopbackGatewayRewriteTests {
         #expect(result[1] == "BIND=127.0.0.1:80")  // unchanged
         #expect(result[2] == "CACHE=redis://10.1.2.3:6379")
     }
+
+    @Test("Rewrite is off by default so explicit public URLs are preserved (#416)")
+    func rewriteIsOptIn() {
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: nil))
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: ["app": "web"]))
+        #expect(!ContainerCreateRoute.shouldRewriteLoopback(labels: ["socktainer.rewrite-loopback": "false"]))
+        #expect(ContainerCreateRoute.shouldRewriteLoopback(labels: ["socktainer.rewrite-loopback": "true"]))
+    }
 }
 
 @Suite("ContainerCreateRoute — peer hostname rewrite")
@@ -400,6 +408,61 @@ struct CapabilityValidationTests {
     }
 }
 
+/// Regression tests for issue #361: `HostConfig.Privileged` was decoded but never
+/// consulted, so `docker run --privileged` (and buildx's docker-container driver,
+/// which creates its buildkit container with `Privileged: true` rather than
+/// `CapAdd`) silently ran without the capabilities buildkitd needs to rbind-mount
+/// its build context.
+@Suite("ContainerCreateRoute.requestedCapAdd")
+struct PrivilegedCapAddTests {
+
+    private func decodeHostConfig(_ json: String) -> HostConfig {
+        try! JSONDecoder().decode(HostConfig.self, from: Data(json.utf8))
+    }
+
+    @Test("Privileged with no CapAdd grants ALL, matching ClientBuilderService's own builder container")
+    func privilegedGrantsAll() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":true}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["ALL"])
+    }
+
+    @Test("Privileged alongside an explicit CapAdd list still grants ALL")
+    func privilegedWithExplicitCapAddStillGrantsAll() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":true,"CapAdd":["NET_ADMIN"]}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["NET_ADMIN", "ALL"])
+    }
+
+    @Test("Privileged with CapAdd already containing ALL does not duplicate it")
+    func privilegedWithAllAlreadyPresentIsNotDuplicated() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":true,"CapAdd":["ALL"]}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["ALL"])
+    }
+
+    @Test("Privileged false leaves CapAdd untouched")
+    func nonPrivilegedLeavesCapAddUntouched() {
+        let hostConfig = decodeHostConfig(#"{"Privileged":false,"CapAdd":["NET_ADMIN"]}"#)
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: hostConfig) == ["NET_ADMIN"])
+    }
+
+    @Test("No HostConfig yields no capabilities")
+    func nilHostConfigYieldsEmpty() {
+        #expect(ContainerCreateRoute.requestedCapAdd(hostConfig: nil) == [])
+    }
+
+    @Test("A privileged create request reaches the image stage instead of being rejected")
+    func privilegedCreateRequestReachesImageStage() async throws {
+        try await withCreateRouteApp(maxBodySize: "64mb") { app in
+            try await app.testing().test(
+                .POST, "/v1.51/containers/create?name=privileged",
+                headers: ["Content-Type": "application/json"],
+                body: ByteBuffer(string: #"{"Image":"socktainer-nonexistent-test-image:missing","HostConfig":{"Privileged":true}}"#)
+            ) { res async in
+                expectReachedImageStage(res)
+            }
+        }
+    }
+}
+
 @Suite("ContainerCreateRoute.vCpus")
 struct VCpusConversionTests {
 
@@ -567,6 +630,28 @@ struct DockerSocketRelayRouteTests {
     }
 }
 
+@Suite("ContainerCreateRoute.portBindingsLabelValue")
+struct PortBindingsLabelTests {
+    private let logger = Logger(label: "test")
+
+    @Test("A request without PortBindings is not persisted, an empty one is")
+    func emptyBindingsPersisted() {
+        #expect(ContainerCreateRoute.portBindingsLabelValue(for: nil, logger: logger) == nil)
+        #expect(ContainerCreateRoute.portBindingsLabelValue(for: [:], logger: logger) == "{}")
+    }
+
+    @Test("Requested bindings round-trip as JSON, unset HostIp and HostPort included")
+    func bindingsRoundTrip() throws {
+        let request = ["80/tcp": [PortBinding(HostIp: "", HostPort: "")], "81/tcp": [PortBinding(HostIp: "127.0.0.1", HostPort: "18081")]]
+        let label = try #require(ContainerCreateRoute.portBindingsLabelValue(for: request, logger: logger))
+        let decoded = try JSONDecoder().decode([String: [PortBinding]].self, from: Data(label.utf8))
+        #expect(decoded["80/tcp"]?.first?.HostIp == "")
+        #expect(decoded["80/tcp"]?.first?.HostPort == "")
+        #expect(decoded["81/tcp"]?.first?.HostIp == "127.0.0.1")
+        #expect(decoded["81/tcp"]?.first?.HostPort == "18081")
+    }
+}
+
 @Suite("ContainerCreateRoute.restartPolicyLabel")
 struct RestartPolicyLabelTests {
     private let logger = Logger(label: "test")
@@ -682,6 +767,30 @@ struct ConvertPortBindingsTests {
         #expect(try convertPortBindings(from: ["notaport": [PortBinding(HostIp: nil, HostPort: "0")]]).isEmpty)
         #expect(try convertPortBindings(from: ["80/tcp/extra": [PortBinding(HostIp: nil, HostPort: "0")]]).isEmpty)
         #expect(try convertPortBindings(from: ["80/sctp": [PortBinding(HostIp: nil, HostPort: "0")]]).isEmpty)
+    }
+
+    @Test("PublishAllPorts allocates a host port for an exposed port with no binding (#434)")
+    func publishAllAllocatesExposedPort() throws {
+        let bindings = publishAllPortBindings(bindings: [:], exposed: ["5000/tcp"])
+        let ports = try convertPortBindings(from: bindings)
+        #expect(ports.count == 1)
+        #expect(ports[0].containerPort == 5000)
+        #expect(ports[0].hostPort != 0)
+    }
+
+    @Test("PublishAllPorts keeps an explicit binding for an exposed port")
+    func publishAllKeepsExplicitBinding() throws {
+        let bindings = publishAllPortBindings(
+            bindings: ["5000/tcp": [PortBinding(HostIp: nil, HostPort: "15000")]], exposed: ["5000/tcp"])
+        let ports = try convertPortBindings(from: bindings)
+        #expect(ports.count == 1)
+        #expect(ports[0].hostPort == 15000)
+    }
+
+    @Test("PublishAllPorts treats a bare port as tcp and dedupes image and request ports")
+    func publishAllNormalizesAndDedupes() {
+        let bindings = publishAllPortBindings(bindings: [:], exposed: ["8080", "8080/tcp", "53/udp"])
+        #expect(Set(bindings.keys) == ["8080/tcp", "53/udp"])
     }
 }
 

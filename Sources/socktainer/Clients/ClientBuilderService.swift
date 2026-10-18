@@ -144,7 +144,7 @@ struct ClientBuilderService: ClientBuilderProtocol {
             do {
                 let socket = try await dialBuilderSocket()
                 let group = MultiThreadedEventLoopGroup(numberOfThreads: System.coreCount)
-                let builder = try Builder(socket: socket, group: group, logger: logger)
+                let builder = try await Builder(socket: socket, group: group, logger: logger)
                 do {
                     _ = try await builder.info()
                     return builder
@@ -212,7 +212,12 @@ struct ClientBuilderService: ClientBuilderProtocol {
         let builderPlatform = Platform(arch: "arm64", os: "linux", variant: "v8")
         let useRosetta = containerSystemConfig.build.rosetta
 
-        let image = try await ClientImage.fetch(reference: builderImage, platform: builderPlatform, containerSystemConfig: containerSystemConfig)
+        let image = try await ClientImage.fetch(
+            reference: builderImage,
+            platform: builderPlatform,
+            scheme: RegistryScheme.scheme(forReference: builderImage, internalDnsDomain: containerSystemConfig.dns.domain),
+            containerSystemConfig: containerSystemConfig
+        )
         _ = try await image.getCreateSnapshot(platform: builderPlatform)
         let imageDesc = ImageDescription(reference: builderImage, descriptor: image.descriptor)
 

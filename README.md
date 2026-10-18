@@ -1,7 +1,15 @@
 # Socktainer 🚢
 
-> [!IMPORTANT]
-> Both `socktainer` and [Apple container](https://github.com/apple/container) are still under heavy development!
+[![Website](https://img.shields.io/badge/website-socktainer.github.io-blue)](https://socktainer.github.io)
+[![Release](https://img.shields.io/github/v/release/socktainer/socktainer)](https://github.com/socktainer/socktainer/releases)
+[![Homebrew](https://img.shields.io/homebrew/v/socktainer)](https://formulae.brew.sh/formula/socktainer)
+[![Build](https://github.com/socktainer/socktainer/actions/workflows/next-build.yaml/badge.svg)](https://github.com/socktainer/socktainer/actions/workflows/next-build.yaml)
+[![License](https://img.shields.io/github/license/socktainer/socktainer)](LICENSE)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/Pw9VWKcUEt)
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/socktainer/media/main/socktainer-demo.gif" alt="Socktainer demo: Docker CLI talking to Apple containers through socktainer" width="800">
+</p>
 
 > [!NOTE]
 > `socktainer` maintains to be compatible with [Docker Engine API v1.51](https://github.com/moby/moby/blob/v28.5.2/api/swagger.yaml).
@@ -42,6 +50,8 @@ Socktainer is a CLI/daemon that exposes a **Docker-compatible REST API** on top 
 
 It allows common Docker clients (like the Docker CLI) to interact with local containers on macOS using the Docker API surface 🐳💻.
 
+📖 Documentation and website: **[socktainer.github.io](https://socktainer.github.io)**
+
 [**Podman Desktop Apple Container extension**](https://github.com/podman-desktop/extension-apple-container) uses socktainer to visualize Apple containers/images in [Podman Desktop](https://podman-desktop.io/).
 
 ---
@@ -54,10 +64,37 @@ Get started with socktainer CLI in just a few commands:
 
 ```bash
 ./socktainer
-FolderWatcher] Started watching $HOME/Library/Application Support/com.apple.container
+[ INFO ] Docker context 'socktainer' ready — run: docker context use socktainer
+[ NOTICE ] DNS server listening on port 2054
 [ NOTICE ] Server started on http+unix: $HOME/.socktainer/container.sock
 ...
 ```
+
+If Apple Container's own service isn't already running, socktainer starts it
+automatically first (like colima does for Docker) — no separate `container
+system start` step needed — then continues with the rest of startup above:
+
+```text
+Launching container-apiserver...
+[ INFO ] Apple Container service not running — attempting to start it...
+[ INFO ] Apple Container service started
+[ INFO ] Docker context 'socktainer' ready — run: docker context use socktainer
+...
+```
+
+<details>
+<summary>Opt out of automatic Apple Container startup</summary>
+
+Pass `--no-auto-start` to skip this — useful in CI or when managing Apple
+Container's lifecycle yourself. If the service still isn't running, the normal
+compatibility check (unless that's also disabled) catches it and aborts with a
+clear message rather than starting socktainer against a dead backend:
+
+```bash
+socktainer --no-auto-start
+```
+
+</details>
 
 ### Using Docker CLI 🐳
 
@@ -132,7 +169,7 @@ DOCKER_HOST=unix://$HOME/.socktainer/container.sock docker images
 ## Requirements 📋
 
 - **macOS 26 (Tahoe) on Apple Silicon (arm64)** Apple’s container APIs only work on arm64 Macs 🍏💻
-- **Apple Container 0.6.0**
+- **Apple Container 1.5.0**
 
 ---
 
@@ -253,19 +290,25 @@ automatically removes it when a Postgres container is created, before
 **Opt out** — set `SOCKTAINER_CLEAN_VOLUMES=false` globally, or label a
 specific volume with `socktainer.clean-volumes=false`.
 
+### Loopback URLs in environment variables
+
+Like Docker, Socktainer passes environment values through unchanged, so
+`127.0.0.1` inside a container refers to the container itself. To have
+URL-form values (`scheme://127.0.0.1:PORT` or `user@127.0.0.1:PORT`) rewritten
+to the network gateway for a container on a named network, opt in with the
+`socktainer.rewrite-loopback=true` container label.
+
 ---
 
 ## Building from Source 🏗️
 
 ### Prerequisites
 
-- **Swift 6.2** (requirements from Apple container)
-- **Xcode 26** (select the correct toolchain if installed in a custom location)
+- **Swift 6.4**
+- **Xcode with the Swift 6.4 toolchain** (select the correct toolchain if installed in a custom location)
 
 ```bash
-sudo xcode-select --switch /Applications/Xcode_26.0.0.app/Contents/Developer
-# or
-sudo xcode-select -s /Applications/Xcode-26.app/Contents/Developer
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
 ```
 
 ### Build & Run
@@ -362,7 +405,7 @@ Ownership rules:
 - Running third-party container workloads carries inherent risks. Review sandboxing and container configurations 🔒
 - Docker API compatibility is **partial**, focused on commonly used endpoints. See `Sources/socktainer/Routes/` for implemented routes
 - Private registry auth currently depends on Apple `container` behavior. If login succeeds but private pulls/builds still fail, a manual workaround may be required. See [apple/container#816 comment 3534438608](https://github.com/apple/container/issues/816#issuecomment-3534438608) and [comment 3503618765](https://github.com/apple/container/issues/816#issuecomment-3503618765).
-- `docker run --privileged` is **not supported** — Apple Container has no privileged mode. Use granular `--cap-add` / `--cap-drop` (and `--read-only`, `--sysctl`) instead; `--privileged` is currently ignored rather than granting all capabilities.
+- `docker run --privileged` has no direct Apple Containerization equivalent — Apple Container has no privileged mode — but socktainer maps it onto the closest available approximation: **granting every capability** (`--cap-add=ALL`), the same grant its own builder container uses. This is enough to unblock common uses of `--privileged` (e.g. buildx's `docker-container` driver rbind-mounting its build context), but it is not a full equivalent of real privileged mode — device access, seccomp, and AppArmor are unaffected. Use granular `--cap-add` / `--cap-drop` (and `--read-only`, `--sysctl`) directly if you need finer control than "all or nothing."
 - `docker run --cpus` is honored, but Apple Container allocates a **whole vCPU count** to each container's VM rather than throttling a shared kernel's CFS quota. A fractional value is floored to the nearest whole core (minimum 1) — e.g. `--cpus=1.5` gets 1 vCPU, `--cpus=0.5` still gets 1. `--cpu-shares` (relative weighting) and `--cpu-period`/`--cpu-quota` have no equivalent and are not applied.
 - Bind-mounting `/var/run/docker.sock` (e.g. `-v /var/run/docker.sock:/var/run/docker.sock`, used by tools like Supabase's `vector` log collector) is **transparently relayed** to socktainer's own Docker-compatible API, rather than dropped. This matches Docker's own behavior for the same bind mount, and carries the same well-known risk: **any container that requests this mount gets full control of every other container socktainer manages**, not just itself — the same exposure Docker itself has always had with this idiom, not something new to socktainer. This scales with the number of containers that request the mount, since each gets its own fully-privileged, independent connection.
 - `docker export` streams the container's root filesystem; exporting a running container yields a volatile snapshot, same as Docker. One visible difference: the tar contains **no `/.dockerenv`** — Docker's daemon fabricates that file inside every container at start, Apple Container does not. Tools that probe `/.dockerenv` to detect "am I inside a container" won't find it in filesystems exported from socktainer.
@@ -374,6 +417,7 @@ Ownership rules:
 - `docker update` supports **restart policies only** (`--restart`). CPU and memory limits cannot change after create — Apple Container runs each container in a VM whose resources are fixed at boot. Resource-only updates return an error; a restart-policy update combined with resource flags applies the policy and returns a warning for the ignored fields. Updated policies are stored durably, but the enforcement caveat above applies to them like any other restart policy.
 - `docker load` accepts tarballs from real Docker (plain, gzip or zstd compressed). Index entries whose blobs are not in the tarball are dropped on load — `docker save` on real Docker ships only the pulling platform's blobs while keeping the full multi-platform index, so only that platform is imported.
 - `docker save` works for images that were loaded from a tarball, and the `docker save | docker load` round-trip is supported. It fails with `ContentStore missing blob data` for **registry-pulled** images: Apple's Containerization pull stores the image's full multi-platform index but downloads only the local platform's blobs, and save exports the whole index ([platform limitation](https://github.com/apple/containerization)).
+- `docker rename` works only for containers that have **never been started**, which covers Compose recreation (it renames its new replacement before starting it). Apple Container has no rename and names a container by its id, so socktainer recreates the container under the new name, keeping its Docker ID. A container that has run keeps a writable root filesystem that recreating would lose, so renaming it returns `409 Conflict`.
 - `docker pause` / `docker unpause` are **not supported** — there is no freezer/checkpoint equivalent for Apple Container VMs.
 - `docker network connect` / `disconnect` are accepted as **no-ops**: Virtualization.framework offers no NIC hotplug and Apple Container has no post-create attach API, so network membership is fixed at container create. Containers on user-created networks reach each other by name through socktainer's DNS, which covers the common Compose use.
 - **Static container IPs** (`--ip`, IPAM per-container config) cannot be honored: Apple Container assigns addresses from a rotating allocator with no way to request a specific one. Name-based discovery via socktainer DNS is the supported alternative; addresses stay stable for a container's lifetime.
@@ -414,6 +458,10 @@ services:
 
 If inter-container connections start failing with `no route to host` / `EHOSTUNREACH` after heavy use (many networks created and destroyed), Apple Container's `vmnet` state has degraded — reset it with `container system stop && container system start`, then restart socktainer.
 
+### Internal networks
+
+Use `docker network create --internal <name>` or Compose's `internal: true` to create a network without external connectivity, backed by Apple Container's host-only mode. Network inspect reports `Internal: true`; the driver remains `nat`.
+
 ### Network subnets (IPAM)
 
 Socktainer pins a stable subnet on each network it creates so that inter-container DNS keeps working across a `container system` restart (an unpinned network's subnet is reassigned by `vmnet` on restart, which would leave containers' DNS nameservers pointing at a dead address). An explicit `--subnet` / Compose `ipam.config.subnet` is honored; otherwise a free `192.168.x.0/24` is chosen automatically.
@@ -448,6 +496,7 @@ The one edge case: if two keys normalize to the same string (e.g. `MyKey` and `m
 
 Join the Socktainer community to ask questions, share ideas, or get help:
 
+- **Website**: [socktainer.github.io](https://socktainer.github.io) – documentation and project news
 - **Discord**: [discord.gg/Pw9VWKcUEt](https://discord.gg/Pw9VWKcUEt) – chat in real time with contributors and users
 - **GitHub Discussions**: [socktainer/discussions](https://github.com/socktainer/socktainer/discussions) – ask questions or propose features
 - **GitHub Issues**: [socktainer/issues](https://github.com/socktainer/socktainer/issues) – report bugs or request features

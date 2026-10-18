@@ -80,11 +80,13 @@ protocol ClientContainerProtocol: Sendable {
     func getContainer(id: String) async throws -> ContainerSnapshot?
     func enforceContainerRunning(container: ContainerSnapshot) throws
 
+    func prepareForStart(container: ContainerSnapshot) async throws
     func start(id: String, detachKeys: String?) async throws
     func stop(id: String, signal: String?, timeout: Int?) async throws
     func restart(id: String, signal: String?, timeout: Int?) async throws
     func kill(id: String, signal: String?) async throws
     func delete(id: String) async throws
+    func rename(id: String, newName: String) async throws
     func wait(id: String, condition: ContainerWaitCondition) async throws -> RESTContainerWait
     func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64)
 }
@@ -94,6 +96,9 @@ enum ClientContainerError: Error {
     case notRunning(id: String)
     case ambiguousId(reference: String, matches: [String])
     case unsupportedCondition(ContainerWaitCondition)
+    case invalidName(String)
+    case nameConflict(String)
+    case renameRequiresUnstarted(id: String)
 }
 
 struct ClientContainerService: ClientContainerProtocol {
@@ -145,7 +150,10 @@ struct ClientContainerService: ClientContainerProtocol {
                     }
                 }
             case "name":
-                result = result.filter { values.contains($0.id) }
+                // Docker matches both the API name (with a leading slash)
+                // and the familiar name, allowing anchored patterns for either.
+                let matcher = DockerContainerNameMatcher(patterns: values)
+                result = result.filter { matcher.matches($0.id) }
             case "id":
                 result = result.filter { container in
                     values.contains { value in
@@ -228,14 +236,24 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func getContainer(id: String) async throws -> ContainerSnapshot? {
-        let id = ContainerNameUtility.sanitize(id)
+        // A pre-start injection briefly removes the native container. Keep
+        // lookups (including /start's lookup) outside that replacement window.
+        try await Self.preStartInjectionAdmission.withSlot {
+            try await self.getContainerWithoutPreparationWait(id: id)
+        }
+    }
+
+    private func getContainerWithoutPreparationWait(id: String) async throws -> ContainerSnapshot? {
+        let sanitizedId = ContainerNameUtility.sanitize(id)
         do {
-            let snapshot = try await containerClient.withClient { try await $0.get(id: id) }
+            let snapshot = try await containerClient.withClient { try await $0.get(id: sanitizedId) }
             return Self.isDNSSidecar(snapshot) ? nil : snapshot
         } catch let error as ContainerizationError where error.code == .notFound {
             // The reference may be a Docker-shaped hex ID, or a truncated
             // prefix of one fed back from `docker ps` output; resolve it
-            // against the derived IDs of all containers.
+            // against the derived IDs of all containers. Use the original
+            // unsanitized reference: sanitize() mangles 64-char hex IDs into
+            // non-hex strings (containing "-"), which breaks hex prefix matching.
             let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
             let entries = allContainers.map { (nativeId: $0.id, hexId: DockerContainerID.hexId(for: $0)) }
             switch DockerContainerID.resolve(reference: id, entries: entries) {
@@ -276,6 +294,53 @@ struct ClientContainerService: ClientContainerProtocol {
         }
     }
 
+    /// Rebuild a container so it carries the files copied into it before it was
+    /// ever started.
+    ///
+    /// There is no API to add a mount to a container that already exists, so the
+    /// only way to put the files where the guest will see them is to create it
+    /// again with the mounts included. The name is kept, and the creation
+    /// timestamp travels in a label, so the id the client holds does not change.
+    private static let preStartInjectionAdmission = VMLifecycleAdmission(limit: 1)
+
+    func prepareForStart(container: ContainerSnapshot) async throws {
+        let staged = try await PreStartInjectionStore.shared.mounts(containerId: container.id)
+        guard !staged.isEmpty else { return }
+
+        try await Self.preStartInjectionAdmission.withSlot {
+            // Docker can issue /start while attach is preparing the same container.
+            // Refresh under the gate so a stale snapshot cannot recreate it twice.
+            guard let current = try await self.getContainerWithoutPreparationWait(id: container.id) else {
+                throw ClientContainerError.notFound(id: container.id)
+            }
+            guard current.status == .stopped else { return }
+            try await self.applyPreStartInjections(container: current, staged: staged)
+        }
+    }
+
+    private func applyPreStartInjections(container: ContainerSnapshot, staged: [Filesystem]) async throws {
+        var configuration = container.configuration
+        let existing = Set(configuration.mounts.map(\.destination))
+        let additions = staged.filter { !existing.contains($0.destination) }
+        guard !additions.isEmpty else { return }
+        configuration.mounts.append(contentsOf: additions)
+        let rebuilt = configuration
+
+        let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+        let options = await PreStartInjectionStore.shared.createOptions(containerId: container.id)
+
+        try await containerClient.withClient { try await $0.delete(id: container.id, force: true) }
+        do {
+            try await containerClient.withClient {
+                try await $0.create(configuration: rebuilt, options: options, kernel: kernel)
+            }
+        } catch {
+            // The container is gone and could not be put back. Say so plainly:
+            // a client told only that start failed would look everywhere else.
+            throw ClientContainerError.notFound(id: container.id)
+        }
+    }
+
     private func startInternal(container: ContainerSnapshot) async throws {
         let stdin: FileHandle? = nil
         let stdout: FileHandle? = nil
@@ -283,12 +348,15 @@ struct ClientContainerService: ClientContainerProtocol {
 
         let stdio = [stdin, stdout, stderr]
 
+        try await prepareForStart(container: container)
+
         do {
             let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
             // Clear any exit code recorded by a previous run of this container so
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart).
             await ContainerExitCodeStore.shared.remove(id: container.id)
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
             // Wait for the init process in the background so we can capture its
             // real exit code without blocking the /start response.
@@ -314,7 +382,6 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -334,13 +401,12 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func kill(id: String, signal: String?) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
 
         guard container.status == .running else {
-            throw ClientContainerError.notRunning(id: id)
+            throw ClientContainerError.notRunning(id: container.id)
         }
 
         let signal = signal ?? "SIGKILL"
@@ -350,7 +416,6 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func restart(id: String, signal: String?, timeout: Int?) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
@@ -371,11 +436,82 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     func delete(id: String) async throws {
-        let id = ContainerNameUtility.sanitize(id)
         guard let container = try await getContainer(id: id) else {
             throw ClientContainerError.notFound(id: id)
         }
         try await containerClient.withClient { try await $0.delete(id: container.id) }
+        // After the delete, and by the native id: the reference a client holds may
+        // be a derived Docker id, and a delete that failed leaves a container that
+        // still needs its uploads.
+        try await PreStartInjectionStore.shared.clear(containerId: container.id)
+        ExtraHostsFile.remove(labels: container.configuration.labels)
+    }
+
+    /// Apple Container has no rename and identifies containers by name, so a
+    /// rename rebuilds the container under the new name, the same way staged
+    /// files are applied before start. Only a container that never booted can
+    /// be rebuilt without losing anything: one that ran has a private rootfs
+    /// the rebuild would discard. That covers Compose's recreate, which renames
+    /// its freshly created replacement before starting it.
+    func rename(id: String, newName: String) async throws {
+        let newId = ContainerNameUtility.sanitize(newName)
+        guard ManagedContainer.nameValid(newId) else {
+            throw ClientContainerError.invalidName(newName)
+        }
+        try await Self.preStartInjectionAdmission.withSlot {
+            guard let container = try await self.getContainerWithoutPreparationWait(id: id) else {
+                throw ClientContainerError.notFound(id: id)
+            }
+            let oldId = container.id
+            guard newId != oldId else { return }
+            if try await self.getContainerWithoutPreparationWait(id: newId)?.id == newId {
+                throw ClientContainerError.nameConflict(newId)
+            }
+            let rootfs = AppleContainerTimestampResolver.appSupportURL
+                .appendingPathComponent("containers").appendingPathComponent(oldId)
+                .appendingPathComponent("rootfs.ext4")
+            guard container.status == .stopped, container.startedDate == nil,
+                !FileManager.default.fileExists(atPath: rootfs.path)
+            else {
+                throw ClientContainerError.renameRequiresUnstarted(id: oldId)
+            }
+
+            // Keep the Docker id: clients hold it across the rename (Compose starts by it).
+            // Pin the creation time too: without the label it is read from the
+            // container's directory, which the rebuild replaces.
+            var original = container.configuration
+            let timestampLabel = AppleContainerTimestampResolver.legacyCreationTimestampLabel
+            if original.labels[timestampLabel] == nil,
+                let created = AppleContainerTimestampResolver.containerCreationDate(container)
+            {
+                original.labels[timestampLabel] = String(created.timeIntervalSince1970)
+            }
+            let restore = original
+            var configuration = original
+            configuration.id = newId
+            configuration.labels[DockerContainerID.idSeedLabel] = original.labels[DockerContainerID.idSeedLabel] ?? oldId
+            let renamed = configuration
+
+            let kernel = try await ClientKernel.getDefaultKernel(for: .current)
+            let options = await PreStartInjectionStore.shared.createOptions(containerId: oldId)
+            try await self.containerClient.withClient { try await $0.delete(id: oldId, force: true) }
+            do {
+                try await self.containerClient.withClient {
+                    try await $0.create(configuration: renamed, options: options, kernel: kernel)
+                }
+            } catch {
+                // Put the original back so a failed rename does not lose the container.
+                do {
+                    try await self.containerClient.withClient {
+                        try await $0.create(configuration: restore, options: options, kernel: kernel)
+                    }
+                } catch {
+                    throw ClientContainerError.notFound(id: oldId)
+                }
+                throw error
+            }
+            try await PreStartInjectionStore.shared.move(from: oldId, to: newId)
+        }
     }
 
     // Poll until the container is no longer running, then return the real exit
@@ -507,6 +643,11 @@ struct ClientContainerService: ClientContainerProtocol {
         for container in containersToDelete {
             do {
                 try await containerClient.withClient { try await $0.delete(id: container.id) }
+                // Pruning reclaims a container, so it reclaims what was staged for
+                // it too: those files are whatever a client uploaded, secrets
+                // included.
+                try await PreStartInjectionStore.shared.clear(containerId: container.id)
+                ExtraHostsFile.remove(labels: container.configuration.labels)
                 deletedIds.append(container.id)
             } catch {
                 continue

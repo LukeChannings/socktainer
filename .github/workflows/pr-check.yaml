@@ -35,15 +35,15 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/cache@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build
           key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-spm-
 
-      - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -69,12 +69,12 @@ jobs:
         run: |
           make installer
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: socktainer
           path: ./.build/arm64-apple-macosx/release/socktainer
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: socktainer-installer
           path: ./pkginstaller/out/socktainer-installer.pkg
@@ -84,16 +84,16 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .build
           key: ${{ runner.os }}-spm-${{ hashFiles('**/Package.resolved') }}
           restore-keys: |
             ${{ runner.os }}-spm-
 
-      - uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
           xcode-version: latest-stable
 
@@ -130,10 +130,10 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # fetch the artifact from the build job
-      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: socktainer
 
@@ -144,7 +144,7 @@ jobs:
 
       - name: fetch apple container
         run: |
-          APPLE_CONTAINER_VERSION=$(grep 'let appleContainerVersion' Package.swift | sed -E 's/.*"([0-9.]+)".*/\1/')
+          APPLE_CONTAINER_VERSION=$(python3 -c "import json; d=json.load(open('Package.resolved')); print([p['state']['version'] for p in d['pins'] if p['identity']=='container'][0])")
           wget "https://github.com/apple/container/releases/download/${APPLE_CONTAINER_VERSION}/container-installer-unsigned.pkg" \
             -O container-installer-signed.pkg
 
@@ -247,6 +247,28 @@ jobs:
           sudo docker image ls | grep 'crafted-baseline'
           sudo docker rmi crafted-baseline:latest
 
+      # https://github.com/socktainer/socktainer/issues/399
+      - name: check image lookup by ID
+        run: |
+          sudo docker pull quay.io/podman/hello
+          # Id reported by inspect (config digest)
+          ID=$(sudo docker image inspect quay.io/podman/hello -f '{{.Id}}')
+          sudo docker image inspect "$ID" > /dev/null
+          # ID reported by image ls (index digest): full, bare hex and 12-char short forms
+          LS_ID=$(sudo docker image ls --no-trunc --format '{{.ID}} {{.Repository}}' | awk '/podman\/hello/{print $1; exit}')
+          sudo docker image inspect "$LS_ID" > /dev/null
+          sudo docker image inspect "${LS_ID#sha256:}" > /dev/null
+          sudo docker image inspect "$(echo "${LS_ID#sha256:}" | cut -c1-12)" > /dev/null
+          # other routes accepting an image ID
+          sudo docker history "$ID" > /dev/null
+          sudo docker tag "$ID" hello-by-id:test
+          sudo docker image inspect hello-by-id:test > /dev/null
+          # an ID naming an image with several tags is refused, like docker
+          sudo docker rmi "$ID" 2>&1 | grep 'must be forced'
+          sudo docker rmi hello-by-id:test
+          # unknown IDs keep docker's wording
+          sudo docker image inspect deadbeefdead 2>&1 | grep 'No such image: deadbeefdead'
+
       # NOTE: Disabling tests for now.
       #       Most likely calling some internal function that fails
       #       on CI host.
@@ -262,8 +284,8 @@ jobs:
           # expect specific content returned via `/version` endpoint
           sudo docker version | grep 'socktainer'
           # expect specific Docker engine API versions
-          sudo docker version | grep 'v1.32'
-          sudo docker version | grep 'v1.51'
+          sudo docker version | grep '1.32'
+          sudo docker version | grep '1.51'
 
       - name: check network with socktainer
         run: |

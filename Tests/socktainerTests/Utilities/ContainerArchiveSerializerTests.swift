@@ -14,37 +14,36 @@ struct ContainerArchiveSerializerTests {
         let serializer = ContainerArchiveSerializer()
         let recorder = EventRecorder()
 
-        // 8 concurrent locks against 8 unique ids. If the serialiser
-        // over-synchronised (e.g. one global lock), the elapsed wall time
-        // would be ~8 × the per-body delay; running them in parallel keeps it
-        // close to a single delay.
-        let delay: Duration = .milliseconds(100)
-        let start = ContinuousClock.now
+        // 8 concurrent locks against 8 unique ids. Each body holds its lock
+        // until every body has entered: that can only happen if the locks
+        // overlap. If the serialiser over-synchronised (e.g. one global lock),
+        // the first body would wait for peers that can never enter and hit the
+        // watchdog instead. No wall-clock bound on the success path, so a slow
+        // or heavily loaded machine cannot make this flake.
+        let count = 8
+        let watchdog: Duration = .seconds(30)
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for i in 0..<8 {
+            for i in 0..<count {
                 group.addTask {
                     try await serializer.withLock("id-\(i)") {
                         await recorder.record("enter-\(i)")
-                        try await Task.sleep(for: delay)
+                        let deadline = ContinuousClock.now + watchdog
+                        while await recorder.enterCount < count, ContinuousClock.now < deadline {
+                            try await Task.sleep(for: .milliseconds(5))
+                        }
                         await recorder.record("exit-\(i)")
                     }
                 }
             }
             try await group.waitForAll()
         }
-        let elapsed = ContinuousClock.now - start
 
-        // Generous ceiling: 4× a single delay lets slow CI still pass while
-        // still catching accidental global serialisation (8× or worse).
-        #expect(elapsed < delay * 4, "different-id locks should overlap (elapsed=\(elapsed))")
-
-        // Every id must have entered before any exited if they truly ran in
-        // parallel — check that at least one enter precedes at least one
-        // exit for a different id.
+        // Every id must have entered before any exited: they all held their
+        // locks at the same time.
         let events = await recorder.events
         let firstExitIndex = events.firstIndex { $0.hasPrefix("exit-") } ?? events.count
         let entersBeforeFirstExit = events.prefix(firstExitIndex).filter { $0.hasPrefix("enter-") }.count
-        #expect(entersBeforeFirstExit >= 2, "at least two ids should enter before any exit fires")
+        #expect(entersBeforeFirstExit == count, "all different-id locks should be held at once")
     }
 
     @Test("locks for the same id run strictly serially in FIFO order")
@@ -126,4 +125,5 @@ struct ContainerArchiveSerializerTests {
 private actor EventRecorder {
     private(set) var events: [String] = []
     func record(_ event: String) { events.append(event) }
+    var enterCount: Int { events.filter { $0.hasPrefix("enter-") }.count }
 }

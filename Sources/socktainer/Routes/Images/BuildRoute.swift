@@ -106,6 +106,156 @@ extension BuildRoute {
         try writeHandle.write(contentsOf: terminator)
     }
 
+    /// Writes the request body (the build context tar) to `tarPath` and returns
+    /// the number of bytes written; 0 means no context was supplied.
+    ///
+    /// The body is read unconditionally rather than gated on
+    /// `Transfer-Encoding: chunked`: routes registered through `RegexRouter`
+    /// receive a streamed body over a real socket, so a plain `Content-Length`
+    /// upload (Docker Python SDK) also has `req.body.data == nil` (issue #415).
+    static func receiveBuildContext(_ req: Request, into tarPath: URL) async throws -> Int {
+        var fileHandle: FileHandle?
+        var totalBytesWritten = 0
+
+        do {
+            FileManager.default.createFile(atPath: tarPath.path, contents: nil)
+            fileHandle = try FileHandle(forWritingTo: tarPath)
+
+            // Stream the body directly to the tar file without loading into memory
+            if let bodyData = req.body.data {
+                let data = Data(buffer: bodyData)
+                try fileHandle?.write(contentsOf: data)
+                totalBytesWritten = data.count
+            } else {
+                for try await var chunk in req.body {
+                    guard let data = chunk.readData(length: chunk.readableBytes) else {
+                        continue
+                    }
+                    try fileHandle?.write(contentsOf: data)
+                    totalBytesWritten += data.count
+                }
+            }
+
+            try fileHandle?.synchronize()
+            try fileHandle?.close()
+            fileHandle = nil
+        } catch {
+            // Clean up file handle and partial tar file on error
+            try? fileHandle?.close()
+            try? FileManager.default.removeItem(at: tarPath)
+            req.logger.error("Failed to stream body to tar file: \(error)")
+            throw Abort(.badRequest, reason: "Failed to process request body: \(error.localizedDescription)")
+        }
+        return totalBytesWritten
+    }
+
+    /// Receives the build context into `tempContextDir` and extracts it, returning
+    /// the directory to build from, or `"."` when no context was supplied. In that
+    /// case, and on error, `tempContextDir` is removed before returning.
+    static func prepareBuildContext(_ req: Request, in tempContextDir: URL) async throws -> String {
+        do {
+            // Create temporary directory for build context
+            try FileManager.default.createDirectory(at: tempContextDir, withIntermediateDirectories: true, attributes: nil)
+
+            // Write the body data to a temporary tar file using streaming
+            let tarPath = tempContextDir.appendingPathComponent("context.tar")
+            let totalBytesWritten = try await Self.receiveBuildContext(req, into: tarPath)
+
+            guard totalBytesWritten > 0 else {
+                req.logger.warning("No data received in request body")
+                // "." skips the response-side cleanup, so drop the empty tar now.
+                try? FileManager.default.removeItem(at: tempContextDir)
+                return "."
+            }
+            guard FileManager.default.fileExists(atPath: tarPath.path),
+                let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
+                let fileSize = fileAttributes[.size] as? Int64,
+                fileSize > 0
+            else {
+                req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
+                throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
+            }
+
+            // `docker compose build` (classic builder) streams a build
+            // context whose final tar entry is not padded out to a 512-byte
+            // block and which omits the end-of-archive marker. The Docker
+            // daemon's Go tar reader tolerates this, but libarchive treats
+            // the short final block as a truncated archive and aborts
+            // extraction. Append a terminator of zero bytes so the last
+            // entry's block is completed and a valid end-of-archive marker
+            // is present. Trailing zeros after a well-formed archive are
+            // ignored, so this is safe for already-terminated contexts too.
+            try Self.appendTarTerminator(to: tarPath)
+
+            // Extract the tar archive
+            let extractDir = tempContextDir.appendingPathComponent("context")
+            try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
+
+            do {
+                try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
+            } catch {
+                req.logger.error("Tar extraction failed: \(error)")
+
+                throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
+            }
+            return extractDir.path
+        } catch {
+            // Clean up on error
+            try? FileManager.default.removeItem(at: tempContextDir)
+            throw error
+        }
+    }
+
+    /// `Error.localizedDescription` only produces a useful message for types that
+    /// bridge to `NSError` or explicitly conform to `LocalizedError` — most
+    /// Swift-native errors this route can throw don't. Notably, a failed BuildKit
+    /// step surfaces as `GRPCCore.RPCError`, which carries the real failure reason in
+    /// `.message`/`.code` and has its own `description`, but `.localizedDescription`
+    /// on it ignores that and falls back to a generic, useless
+    /// "The operation couldn't be completed. (GRPCCore.RPCError error 1.)" — so a
+    /// real `RUN` step failure reached the client as that instead of the actual
+    /// command and exit code (issue #386).
+    ///
+    /// Note `error is CustomStringConvertible` is **not** a usable way to detect
+    /// "this type has a real custom description" here: on Darwin, any concrete
+    /// `Error` bridges to `NSError`, which satisfies that check regardless of the
+    /// concrete type — the compiler will flag it as an always-true test. So the
+    /// three known shapes are handled explicitly instead of by a generic runtime
+    /// probe:
+    ///
+    /// - `ContainerizationError` conforms to both `CustomStringConvertible` and
+    ///   `LocalizedError`, and its two descriptions differ: `.description` includes
+    ///   its `.code`, `.errorDescription` doesn't. Special-cased first so its
+    ///   existing (richer) message format doesn't regress.
+    /// - A plain `LocalizedError` — `RPCError` isn't one, but nothing guarantees
+    ///   every error this route can throw won't be — is checked next, since
+    ///   `errorDescription` is the type's own explicit, semantic "here is my
+    ///   message" API and should win over an accidental Mirror-based default.
+    /// - Everything else, including `RPCError`, falls through to plain string
+    ///   interpolation, which calls a type's own `description` when it explicitly
+    ///   conforms to `CustomStringConvertible` (`RPCError` does) — fixing the
+    ///   original #386 gap without depending on the unreliable runtime check above.
+    /// The closing events of a successful build, shaped like moby's classic builder.
+    /// docker-py's `images.build()` takes the image ID from `Successfully built <id>`
+    /// (or a `sha256:<id>` stream) and the Docker CLI from `aux.ID`; without a hex ID
+    /// docker-py raises `BuildError` even though the build succeeded (#414).
+    static func completionEvents(imageID: String?, tag: String?) -> [[String: Any]] {
+        let tagged: [[String: Any]] = tag.map { [["stream": "Successfully tagged \($0)\n"]] } ?? []
+        guard let imageID else { return tagged }
+        let shortID = String(imageID.dropFirst("sha256:".count).prefix(12))
+        return [["aux": ["ID": imageID]], ["stream": "Successfully built \(shortID)\n"]] + tagged
+    }
+
+    static func errorMessage(for error: Error) -> String {
+        if error is ContainerizationError {
+            return "\(error)"
+        }
+        if let localizedError = error as? LocalizedError, let description = localizedError.errorDescription {
+            return description
+        }
+        return "\(error)"
+    }
+
     static func handler(client: ClientContainerProtocol, builderClient: ClientBuilderProtocol, systemConfig: ContainerSystemConfig) -> @Sendable (Request) async throws -> Response
     {
         { req in
@@ -124,7 +274,8 @@ extension BuildRoute {
 
             // Extract values with Docker-compliant defaults
             let dockerfile = query.dockerfile!
-            let targetImageName = query.t ?? UUID().uuidString.lowercased()
+            // nil for an untagged build, which performBuild stores as dangling.
+            let targetImageName = query.t
             let quiet = query.q!
             let noCache = query.nocache!
             let pull = query.pull.map { ["1", "true", "yes", "on"].contains($0.lowercased()) } ?? false
@@ -143,107 +294,12 @@ extension BuildRoute {
             }
 
             // Extract tar archive from request body and unpack to temporary directory
-            let contextDir: String
             let buildUUID = UUID().uuidString
             let appSupportDir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false)
                 .appendingPathComponent("com.apple.container/builder")
             let tempContextDir = appSupportDir.appendingPathComponent(buildUUID)
 
-            do {
-                // Create temporary directory for build context
-                try FileManager.default.createDirectory(at: tempContextDir, withIntermediateDirectories: true, attributes: nil)
-
-                // Check if we have a request body to process
-                let hasBody = req.body.data != nil || req.headers.first(name: "transfer-encoding")?.lowercased() == "chunked"
-
-                if hasBody {
-
-                    // Write the body data to a temporary tar file using streaming
-                    let tarPath = tempContextDir.appendingPathComponent("context.tar")
-                    var fileHandle: FileHandle?
-                    var totalBytesWritten = 0
-
-                    do {
-                        // Create the tar file and open file handle for writing
-                        FileManager.default.createFile(atPath: tarPath.path, contents: nil)
-                        fileHandle = try FileHandle(forWritingTo: tarPath)
-
-                        // Stream the body directly to the tar file without loading into memory
-                        if let bodyData = req.body.data {
-                            // Direct body data available
-                            let data = Data(buffer: bodyData)
-                            try fileHandle?.write(contentsOf: data)
-                            totalBytesWritten = data.count
-                        } else {
-                            var chunkCount = 0
-                            for try await var chunk in req.body {
-                                guard let data = chunk.readData(length: chunk.readableBytes) else {
-                                    continue
-                                }
-                                chunkCount += 1
-                                try fileHandle?.write(contentsOf: data)
-                                totalBytesWritten += data.count
-                            }
-                        }
-
-                        try fileHandle?.synchronize()
-                        try fileHandle?.close()
-                        fileHandle = nil
-                    } catch {
-                        // Clean up file handle and partial tar file on error
-                        try? fileHandle?.close()
-                        try? FileManager.default.removeItem(at: tarPath)
-                        req.logger.error("Failed to stream body to tar file: \(error)")
-                        throw Abort(.badRequest, reason: "Failed to process request body: \(error.localizedDescription)")
-                    }
-
-                    if totalBytesWritten > 0 {
-                        guard FileManager.default.fileExists(atPath: tarPath.path),
-                            let fileAttributes = try? FileManager.default.attributesOfItem(atPath: tarPath.path),
-                            let fileSize = fileAttributes[.size] as? Int64,
-                            fileSize > 0
-                        else {
-                            req.logger.error("Tar file is missing or empty after writing \(totalBytesWritten) bytes")
-                            throw Abort(.badRequest, reason: "Failed to write tar archive to disk")
-                        }
-
-                        // `docker compose build` (classic builder) streams a build
-                        // context whose final tar entry is not padded out to a 512-byte
-                        // block and which omits the end-of-archive marker. The Docker
-                        // daemon's Go tar reader tolerates this, but libarchive treats
-                        // the short final block as a truncated archive and aborts
-                        // extraction. Append a terminator of zero bytes so the last
-                        // entry's block is completed and a valid end-of-archive marker
-                        // is present. Trailing zeros after a well-formed archive are
-                        // ignored, so this is safe for already-terminated contexts too.
-                        try Self.appendTarTerminator(to: tarPath)
-
-                        // Extract the tar archive
-                        let extractDir = tempContextDir.appendingPathComponent("context")
-                        try FileManager.default.createDirectory(at: extractDir, withIntermediateDirectories: true, attributes: nil)
-
-                        do {
-                            try ArchiveUtility.extract(tarPath: tarPath, to: extractDir)
-                        } catch {
-                            req.logger.error("Tar extraction failed: \(error)")
-
-                            throw Abort(.badRequest, reason: "Failed to extract tar archive: \(error.localizedDescription)")
-                        }
-                        contextDir = extractDir.path
-                    } else {
-                        req.logger.warning("No data received in request body")
-                        contextDir = "."
-                    }
-                } else {
-                    // No body provided, use current directory as fallback
-                    req.logger.warning("No build context provided in request body, using current directory as fallback")
-                    contextDir = "."
-                }
-            } catch {
-                // Clean up on error
-                try? FileManager.default.removeItem(at: tempContextDir)
-                throw error
-            }
+            let contextDir = try await Self.prepareBuildContext(req, in: tempContextDir)
 
             let buildArgs = BuildRoute.parseBuildQueryParam(query.buildargs)
             let labels = BuildRoute.parseBuildQueryParam(query.labels)
@@ -277,14 +333,7 @@ extension BuildRoute {
                     } catch {
                         req.logger.error("Build failed: \(error)")
 
-                        // Extract error message - prioritize ContainerizationError message
-                        let errorMessage: String
-                        if error is ContainerizationError {
-                            // Use string interpolation to get ContainerizationError's description
-                            errorMessage = "\(error)"
-                        } else {
-                            errorMessage = error.localizedDescription
-                        }
+                        let errorMessage = BuildRoute.errorMessage(for: error)
 
                         // Docker API compliant error response
                         let errorDetail: [String: Any] = [
@@ -331,7 +380,7 @@ extension BuildRoute {
     private static func performBuild(
         dockerfile: String,
         contextDir: String,
-        targetImageName: String,
+        targetImageName: String?,
         buildArgs: [String],
         labels: [String],
         noCache: Bool,
@@ -349,8 +398,11 @@ extension BuildRoute {
         // Helper function to send Docker API compliant streaming messages
         @Sendable func sendStreamMessage(_ message: String) {
             // Preserve the original message with its formatting
-            let streamResponse: [String: Any] = ["stream": message + "\n"]
-            if let jsonData = try? JSONSerialization.data(withJSONObject: streamResponse),
+            sendEvent(["stream": message + "\n"])
+        }
+
+        @Sendable func sendEvent(_ event: [String: Any]) {
+            if let jsonData = try? JSONSerialization.data(withJSONObject: event),
                 let jsonString = String(data: jsonData, encoding: .utf8)
             {
                 let result = writer.write(.buffer(ByteBuffer(string: jsonString + "\n")))
@@ -382,7 +434,7 @@ extension BuildRoute {
         }
 
         // Send initial build started message
-        sendStreamMessage("Step 1/1 : Starting build for \(targetImageName)")
+        sendStreamMessage("Step 1/1 : Starting build for \(targetImageName ?? "<none>")")
 
         let timeout: Duration = .seconds(300)
 
@@ -414,11 +466,14 @@ extension BuildRoute {
         try FileManager.default.createDirectory(at: tempURL, withIntermediateDirectories: true, attributes: nil)
 
         // Validate and normalize image name
-        let imageName: String = try {
-            let parsedReference = try Reference.parse(targetImageName)
+        // The builder rejects a build without a tag ("ref missing in build context"), so an
+        // untagged build is exported under a throwaway name and renamed once loaded.
+        let buildName: String = try {
+            let parsedReference = try Reference.parse(targetImageName ?? "socktainer-untagged-build:\(buildID.lowercased())")
             parsedReference.normalize()
             return parsedReference.description
         }()
+        let imageName = targetImageName == nil ? nil : buildName
 
         // Setup exports - use BuildCommand approach
         let exports: [Builder.BuildExport] = try ["type=oci"].map { output in
@@ -444,6 +499,9 @@ extension BuildRoute {
             buildArgs: buildArgs,
             // TODO: Implement secrets once integration with buildkit materializes
             secrets: [:],
+            // Same as secrets: the Docker API's SSH forwarding for builds is not
+            // wired through yet, so nothing is offered to the builder.
+            ssh: "",
             contextDir: contextDir,
             dockerfile: dockerfileData,
             dockerignore: nil,
@@ -451,7 +509,7 @@ extension BuildRoute {
             noCache: noCache,
             platforms: [Platform](platforms),
             terminal: nil,  // No terminal for API
-            tags: [imageName],
+            tags: [buildName],
             target: target,
             quiet: quiet,
             exports: exports,
@@ -486,15 +544,34 @@ extension BuildRoute {
         }
         sendStreamMessage(" ---> Loading built image")
 
-        let loaded = try await ClientImage.load(from: destPath.absolutePath())
+        var loadedImages = try await ClientImage.load(from: destPath.absolutePath()).images
 
-        for image in loaded.images {
+        // Docker leaves an untagged build as <none>:<none>. Apple Container cannot store a
+        // nameless image, so rename it to the "untagged@<digest>" name the store itself gives
+        // name-less loads, which Docker-facing routes report as dangling.
+        if imageName == nil, let index = loadedImages.firstIndex(where: { $0.reference == buildName }) {
+            let image = loadedImages[index]
+            loadedImages[index] = try await image.tag(new: "untagged@\(image.digest)")
+            try await ClientImage.delete(reference: image.reference, garbageCollect: false)
+        }
+
+        for image in loadedImages {
             sendStreamMessage(" ---> Unpacking image layers")
             try await image.unpack(platform: nil, progressUpdate: { _ in })
         }
 
-        // Send success message in Docker API format
-        sendStreamMessage("Successfully built \(imageName)")
+        // The image ID is the built platform's config digest, the same `Id` image inspect reports.
+        let builtImage = loadedImages.first { $0.reference == imageName } ?? loadedImages.first
+        var imageID: String?
+        if let builtImage, let platform = platforms.first {
+            imageID = try? await builtImage.manifest(for: platform).config.digest
+        }
+        if imageID == nil {
+            logger.warning("BuildRoute: could not determine the image ID of \(imageName ?? "untagged build")")
+        }
+        for event in completionEvents(imageID: imageID, tag: imageName) {
+            sendEvent(event)
+        }
 
         _ = writer.write(.end)
     }

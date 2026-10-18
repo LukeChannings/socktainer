@@ -46,6 +46,35 @@ struct ContainerArchivePutCreatedTests {
         // The pre-existing base image content must survive the offline edit.
         #expect(reader.exists(FilePath("/etc/hostname")))
     }
+
+    @Test("a container that booted before and lost its rootfs is not re-provisioned from the image")
+    func putArchiveOnBootedContainerWithoutRootfs() async throws {
+        let fixture = CreatedContainerFixture(id: "booted-cp")
+        defer { fixture.cleanUp() }
+        try fixture.writeCreatedContainer(baseFile: "/etc/hostname", baseContents: "host\n")
+
+        // It started once (startedDate set), but its rootfs.ext4 is gone.
+        // Provisioning would silently resurrect it from the image carrying
+        // only the uploaded files, so the PUT must fail instead.
+        let base = try makeContainerSnapshot(
+            nativeId: "booted-cp", ip: "192.168.65.2", network: "default", labels: [:], status: .stopped)
+        let container = ContainerSnapshot(
+            configuration: base.configuration, status: .stopped, networks: [], startedDate: Date())
+        let tar = try fixture.makeTar(fileName: "injected.txt", contents: "x\n")
+        defer { try? FileManager.default.removeItem(at: tar) }
+
+        do {
+            try await fixture.service.putArchive(
+                container: container, path: "/", tarPath: tar, noOverwriteDirNonDir: false)
+            Issue.record("expected rootfsNotFound; got success")
+        } catch let error as ClientArchiveError {
+            guard case .rootfsNotFound = error else {
+                Issue.record("expected rootfsNotFound; got \(error)")
+                return
+            }
+        }
+        #expect(!FileManager.default.fileExists(atPath: fixture.rootfs.path))
+    }
 }
 
 /// A temporary app-support tree with a created-but-not-started container:
@@ -97,7 +126,7 @@ private struct CreatedContainerFixture {
         )
         let image = ImageDescription(
             reference: "alpine:latest",
-            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:abc", size: 0)
+            descriptor: Descriptor(mediaType: "application/vnd.oci.image.index.v1+json", digest: "sha256:" + String(repeating: "a", count: 64), size: 0)
         )
         let config = ContainerConfiguration(id: id, image: image, process: proc)
 

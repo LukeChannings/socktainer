@@ -32,8 +32,10 @@ let
   buildVersion = "0.0.0-nix";
   buildGitCommit = "unknown";
   buildTime = "1970-01-01T00:00:00Z";
-  dockerEngineApiMinVersion = "v1.32";
-  dockerEngineApiMaxVersion = "v1.51";
+  # Bare numbers, no "v" prefix: Docker clients parse these (docker-py's
+  # negotiation fails on "v1.51"). Keep in sync with the Makefile.
+  dockerEngineApiMinVersion = "1.32";
+  dockerEngineApiMaxVersion = "1.51";
 in
 stdenvNoCC.mkDerivation {
   pname = "socktainer";

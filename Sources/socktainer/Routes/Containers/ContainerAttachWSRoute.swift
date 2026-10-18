@@ -31,9 +31,7 @@ extension ContainerAttachWSRoute {
                 throw Abort(.badRequest, reason: "Missing container ID")
             }
             let query = try req.query.decode(ContainerAttachWSQuery.self)
-            guard let container = try await client.getContainer(id: id) else {
-                throw Abort(.notFound, reason: "No such container: \(id)")
-            }
+            let container = try await ContainerAttachRoute.preparedContainer(id: id, client: client)
 
             // moby: MuxStreams=false — WebSocket is the mux; raw binary frames,
             // no stdcopy header, matches moby's wsContainersAttach behaviour.
@@ -99,6 +97,7 @@ extension ContainerAttachWSRoute {
         }
 
         do {
+            try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
         } catch {
             if !isBenignStartRace(error) {
@@ -109,6 +108,9 @@ extension ContainerAttachWSRoute {
                 return
             }
         }
+
+        // Executing now: open a run so this exit's `die` is claimable exactly once.
+        let runEpoch = await DieEventOwnership.shared.beginRun(id: container.id)
 
         await ProcessRegistry.shared.set(id: container.id, process: process)
 
@@ -140,7 +142,8 @@ extension ContainerAttachWSRoute {
                     fallbackImage: container.configuration.image.reference,
                     fallbackLabels: LabelNormalization.restore(container.configuration.labels),
                     dnsServer: req.application.storage[SocktainerDNSServerKey.self],
-                    broadcaster: broadcaster
+                    broadcaster: broadcaster,
+                    runEpoch: runEpoch
                 )
 
                 try? await ws.close()
