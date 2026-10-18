@@ -112,7 +112,15 @@ jobs:
           token_file="$(mktemp)"
           trap 'rm -f "$token_file"' EXIT
           printf '%s' "$NIKS3_AUTH_TOKEN" > "$token_file"
-          mapfile -t paths < "$RUNNER_TEMP/socktainer-paths"
+          # macOS /bin/bash is 3.2: no `mapfile`.
+          paths=()
+          while IFS= read -r path || [ -n "$path" ]; do
+            if [ -n "$path" ]; then paths+=("$path"); fi
+          done < "$RUNNER_TEMP/socktainer-paths"
+          if [ "${#paths[@]}" -eq 0 ]; then
+            echo "error: no store paths to push" >&2
+            exit 1
+          fi
           nix run github:Mic92/niks3 -- push \
             --server-url https://nix.channings.me \
             --auth-token-path "$token_file" \
