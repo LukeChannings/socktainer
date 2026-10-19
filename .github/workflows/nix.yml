@@ -121,14 +121,13 @@ jobs:
             echo "error: no store paths to push" >&2
             exit 1
           fi
-          # Pin to the niks3 rev the server at nix.channings.me runs (the
-          # hartlandia flake's niks3 input). An unpinned `github:Mic92/niks3`
-          # tracks the latest release, and a client newer than the server
-          # speaks an upload protocol it rejects (400 "HTTP method not
-          # supported" creating the pending closure). Bump in lockstep with
-          # the server.
-          niks3_rev=7c6858b38b59d771eb75a298c30d992fff672cc4
-          nix run "github:Mic92/niks3/$niks3_rev" -- push \
-            --server-url https://nix.channings.me \
+          # --server-url is the niks3 coordinator API, not the cache. The
+          # cache (extra-substituters, read-only Garage web) is
+          # nix.channings.me; the niks3 API that `push` POSTs to lives at
+          # niks3.nix.channings.me. Pointing it at the cache URL hits the
+          # GET-only Garage endpoint and fails with Garage's 400 "HTTP method
+          # not supported".
+          nix run github:Mic92/niks3 -- push \
+            --server-url https://niks3.nix.channings.me \
             --auth-token-path "$token_file" \
             "${paths[@]}"
