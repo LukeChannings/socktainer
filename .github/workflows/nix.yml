@@ -121,7 +121,14 @@ jobs:
             echo "error: no store paths to push" >&2
             exit 1
           fi
-          nix run github:Mic92/niks3 -- push \
+          # Pin to the niks3 rev the server at nix.channings.me runs (the
+          # hartlandia flake's niks3 input). An unpinned `github:Mic92/niks3`
+          # tracks the latest release, and a client newer than the server
+          # speaks an upload protocol it rejects (400 "HTTP method not
+          # supported" creating the pending closure). Bump in lockstep with
+          # the server.
+          niks3_rev=7c6858b38b59d771eb75a298c30d992fff672cc4
+          nix run "github:Mic92/niks3/$niks3_rev" -- push \
             --server-url https://nix.channings.me \
             --auth-token-path "$token_file" \
             "${paths[@]}"
