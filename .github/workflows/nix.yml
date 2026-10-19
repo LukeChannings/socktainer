@@ -23,8 +23,11 @@
 # https://github.com/actions/runner-images
 #
 # Secrets:
-#   NIKS3_AUTH_TOKEN — upload token for nix.channings.me (niks3 signs
-#   server-side; no client signing key needed).
+#   NIKS3_CI_TOKEN — the Kanidm CI service-account API token. The push step
+#   exchanges it (RFC 8693) at id.channings.me for a short-lived aud=niks3
+#   OIDC token; niks3 grants it write scope and signs server-side, so no
+#   client signing key is needed (ADR-0010). A static niks3 token is NOT used
+#   — it expires and 401s. Must be a member of the niks3_ci Kanidm group.
 ---
 name: nix
 
@@ -97,6 +100,8 @@ jobs:
           "$out/bin/socktainer" --version
           /usr/bin/otool -L "$out/bin/socktainer"
 
+      # The refresher heredoc carries an irreducible OIDC URN and jq filter.
+      # yamllint disable rule:line-length
       - name: Push to cache
         # Pushes on PRs too (same-repo branches only — fork PRs get no
         # secrets), so a branch's build is cached before it merges. niks3
@@ -105,13 +110,19 @@ jobs:
           ${{ github.event.pull_request.head.repo.full_name == github.repository
           || github.event_name == 'push' }}
         env:
-          # niks3 wants the token in a file (--auth-token-path); passing it on
-          # the command line is deprecated.
-          NIKS3_AUTH_TOKEN: ${{ secrets.NIKS3_AUTH_TOKEN }}
+          # Per ADR-0010, CI authenticates to niks3 via OIDC: a long-lived
+          # Kanidm service-account token, exchanged (RFC 8693) for a
+          # short-lived aud=niks3 access token. A static niks3 token was
+          # deliberately rejected there — it expires (~15m) and then silently
+          # 401s, which is exactly how this step failed. The refresher below
+          # re-mints on demand via --auth-token-script, so a build that
+          # outlasts one token still pushes.
+          NIKS3_CI_TOKEN: ${{ secrets.NIKS3_CI_TOKEN }}
         run: |
-          token_file="$(mktemp)"
-          trap 'rm -f "$token_file"' EXIT
-          printf '%s' "$NIKS3_AUTH_TOKEN" > "$token_file"
+          if [ -z "$NIKS3_CI_TOKEN" ]; then
+            echo "::error::NIKS3_CI_TOKEN secret is empty or not set"
+            exit 1
+          fi
           # macOS /bin/bash is 3.2: no `mapfile`.
           paths=()
           while IFS= read -r path || [ -n "$path" ]; do
@@ -121,13 +132,36 @@ jobs:
             echo "error: no store paths to push" >&2
             exit 1
           fi
-          # --server-url is the niks3 coordinator API, not the cache. The
-          # cache (extra-substituters, read-only Garage web) is
-          # nix.channings.me; the niks3 API that `push` POSTs to lives at
-          # niks3.nix.channings.me. Pointing it at the cache URL hits the
-          # GET-only Garage endpoint and fails with Garage's 400 "HTTP method
-          # not supported".
-          nix run github:Mic92/niks3 -- push \
-            --server-url https://niks3.nix.channings.me \
-            --auth-token-path "$token_file" \
-            "${paths[@]}"
+          # Seed the Kanidm CI token + a refresher that exchanges it (RFC 8693)
+          # at the Kanidm token endpoint for an aud=niks3 OIDC token. niks3's
+          # provider grants `write` to any aud=niks3 token, and only niks3_ci
+          # group members can mint one. The emitted JSON ({token, expires_at})
+          # is niks3's auth-token-script contract; expires_at lets it cache
+          # until 75% of the token's life, then re-mint.
+          install -d -m 700 "$HOME/.config/niks3"
+          umask 077
+          printf '%s' "$NIKS3_CI_TOKEN" > "$HOME/.config/niks3/ci-token"
+          cat > "$HOME/.config/niks3/refresh-token" <<'SCRIPT'
+          set -euo pipefail
+          resp=$(curl -fsS -X POST "https://id.channings.me/oauth2/token" \
+            -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+            -d audience=niks3 \
+            -d scope=openid \
+            -d subject_token_type=urn:ietf:params:oauth:token-type:access_token \
+            -d client_id=niks3 \
+            --data-urlencode subject_token@"$HOME/.config/niks3/ci-token")
+          printf '%s' "$resp" | jq -e 'if .access_token then {token: .access_token, expires_at: (now + (.expires_in // 900) | todate)} else error("niks3 token exchange returned no access_token") end'
+          SCRIPT
+          # --server-url is the niks3 coordinator API, not the cache: the cache
+          # (extra-substituters, read-only Garage web) is nix.channings.me;
+          # the niks3 API that `push` POSTs to lives at niks3.nix.channings.me.
+          # niks3 shell-splits --auth-token-script and execs argv[0] directly,
+          # so pass this step's bash ($BASH, absolute) as the interpreter for
+          # the shebang-less refresher. jq (used by the refresher) is put on
+          # PATH via `nix shell`; curl is already at /usr/bin on macOS.
+          nix shell nixpkgs#jq --command \
+            nix run github:Mic92/niks3 -- push \
+              --server-url https://niks3.nix.channings.me \
+              --auth-token-script "$BASH $HOME/.config/niks3/refresh-token" \
+              "${paths[@]}"
+      # yamllint enable rule:line-length
