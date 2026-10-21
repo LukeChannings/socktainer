@@ -106,12 +106,45 @@ struct ClientContainerService: ClientContainerProtocol {
 
     func list(showAll: Bool, filters: [String: [String]]) async throws -> [ContainerSnapshot] {
         let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
-        let running = showAll ? allContainers : allContainers.filter { $0.status == .running }
-        return Self.applyFilters(running, filters: filters, allContainers: allContainers)
+        return Self.listing(allContainers, showAll: showAll, filters: filters)
+    }
+
+    /// The `list(showAll:filters:)` result for `allContainers`, DNS sidecars already removed.
+    static func listing(_ allContainers: [ContainerSnapshot], showAll: Bool, filters: [String: [String]]) -> [ContainerSnapshot] {
+        let visible = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
+        let running = showAll ? visible : visible.filter { $0.status == .running }
+        return applyFilters(running, filters: filters, allContainers: allContainers)
     }
 
     static func withoutDNSSidecars(_ snapshots: [ContainerSnapshot]) -> [ContainerSnapshot] {
         snapshots.filter { !isDNSSidecar($0) }
+    }
+
+    /// Containers owned by an Apple Container plugin (`container k8s` cluster nodes,
+    /// `container machine` VMs) are managed through that plugin, and removing one from
+    /// under it breaks what it manages, so they stay out of Docker listings and prunes —
+    /// much as `container ls` hides machines. A `label` filter that names the plugin
+    /// label brings them back. Lookups by name or ID still find them.
+    static func isPluginContainer(_ snapshot: ContainerSnapshot) -> Bool {
+        snapshot.configuration.labels[ResourceLabelKeys.plugin] != nil
+    }
+
+    static func withoutPluginContainers(_ snapshots: [ContainerSnapshot], unlessLabelFilters labelFilters: [String]?) -> [ContainerSnapshot] {
+        guard !namesPluginLabel(labelFilters ?? []) else { return snapshots }
+        return snapshots.filter { !isPluginContainer($0) }
+    }
+
+    /// Whether any `key`, `key=value` or `key!=value` label filter has the plugin label as its key.
+    static func namesPluginLabel(_ labelFilters: [String]) -> Bool {
+        labelFilters.contains { filter in
+            let key: Substring
+            if let notEqual = filter.range(of: "!=") {
+                key = filter[..<notEqual.lowerBound]
+            } else {
+                key = filter.prefix { $0 != "=" }
+            }
+            return key == ResourceLabelKeys.plugin
+        }
     }
 
     static func isDNSSidecar(_ snapshot: ContainerSnapshot) -> Bool {
@@ -342,43 +375,72 @@ struct ClientContainerService: ClientContainerProtocol {
     }
 
     private func startInternal(container: ContainerSnapshot) async throws {
-        let stdin: FileHandle? = nil
-        let stdout: FileHandle? = nil
-        let stderr: FileHandle? = nil
-
-        let stdio = [stdin, stdout, stderr]
-
-        try await prepareForStart(container: container)
+        // A client that attached before this start (`docker run`, `docker start -a`, attached
+        // `docker compose up`) parked its pipes; boot with them so its stream gets the output.
+        // Claimed before anything can fail, so every failure below reaches the waiting attach.
+        let attached = await PendingAttachStart.shared.claim(containerId: container.id)
+        let stdio = attached?.stdioArray ?? [nil, nil, nil]
 
         do {
-            let process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
+            try await prepareForStart(container: container)
+        } catch {
+            if let attached {
+                attached.closeAll()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
+            }
+            throw error
+        }
+
+        let process: ClientProcess
+        do {
+            process = try await containerClient.withClient { try await $0.bootstrap(id: container.id, stdio: stdio) }
+        } catch {
+            if let attached {
+                attached.closeAll()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
+            }
+            // A container that is already booted was started by an earlier request.
+            if Self.isAlreadyStarted(error) { return }
+            throw error
+        }
+
+        do {
             // Clear any exit code recorded by a previous run of this container so
             // /wait blocks for the new init process rather than immediately
             // returning the stale code (e.g. after a restart).
             await ContainerExitCodeStore.shared.remove(id: container.id)
             try await ExtraHostsFile.refresh(containerId: container.id)
             try await process.start()
-            // Wait for the init process in the background so we can capture its
-            // real exit code without blocking the /start response.
-            let containerId = container.id
-            let exitLogger = Logger(label: "socktainer.exitcode")
-            Task.detached {
-                let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
-                    try await process.wait()
-                }
-                await ContainerExitCodeStore.shared.set(id: containerId, code: code)
-            }
         } catch {
-            // NOTE: If bootstrap fails because container is already booted,
-            //       the attach handler may have already bootstrapped it
-            let errorMessage = error.localizedDescription
-            if errorMessage.contains("booted") || errorMessage.contains("expected to be in created state") {
-                return
+            if let attached {
+                attached.closeAfterHandoff()
+                await PendingAttachStart.shared.finish(containerId: container.id, result: .failure(error))
             }
-
-            // Re-throw any other errors
+            if Self.isAlreadyStarted(error) { return }
             throw error
         }
+
+        if attached != nil {
+            // The attach stream takes it from here, including recording the exit code.
+            await PendingAttachStart.shared.finish(containerId: container.id, result: .success(process))
+            return
+        }
+
+        // Wait for the init process in the background so we can capture its
+        // real exit code without blocking the /start response.
+        let containerId = container.id
+        let exitLogger = Logger(label: "socktainer.exitcode")
+        Task.detached {
+            let code = await ContainerExitCodeStore.resolveExitCode(logger: exitLogger) {
+                try await process.wait()
+            }
+            await ContainerExitCodeStore.shared.set(id: containerId, code: code)
+        }
+    }
+
+    private static func isAlreadyStarted(_ error: Error) -> Bool {
+        let errorMessage = error.localizedDescription
+        return errorMessage.contains("booted") || errorMessage.contains("expected to be in created state")
     }
 
     func stop(id: String, signal: String?, timeout: Int?) async throws {
@@ -569,10 +631,10 @@ struct ClientContainerService: ClientContainerProtocol {
         return RESTContainerWait(statusCode: Int64(code))
     }
 
-    func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
-        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
-
-        var containersToDelete: [ContainerSnapshot] = allContainers.filter { $0.status == .stopped }
+    /// The containers `prune(filters:)` deletes from `allContainers`, DNS sidecars already removed.
+    static func pruneCandidates(_ allContainers: [ContainerSnapshot], filters: [String: [String]]) -> [ContainerSnapshot] {
+        var containersToDelete: [ContainerSnapshot] = withoutPluginContainers(allContainers, unlessLabelFilters: filters["label"])
+            .filter { $0.status == .stopped }
 
         for (key, values) in filters {
             switch key {
@@ -632,6 +694,12 @@ struct ClientContainerService: ClientContainerProtocol {
                 continue
             }
         }
+        return containersToDelete
+    }
+
+    func prune(filters: [String: [String]]) async throws -> (deletedContainers: [String], spaceReclaimed: Int64) {
+        let allContainers = Self.withoutDNSSidecars(try await containerClient.withClient { try await $0.list() })
+        let containersToDelete = Self.pruneCandidates(allContainers, filters: filters)
 
         // NOTE: Apple container doesn't return the size of the container, only the
         //       image descriptor size (manifest) is logged.

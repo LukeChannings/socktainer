@@ -44,7 +44,7 @@ func configure(_ app: Application) async throws {
     let volumeClient = ClientVolumeService()
     let registryClient = ClientRegistryService()
     let archiveClient = ClientArchiveService(appSupportPath: appleContainerAppSupportUrl)
-    let builderClient = ClientBuilderService(appSupportURL: appleContainerAppSupportUrl, containerSystemConfig: systemConfig)
+    let builderClient = ClientBuilderService(containerSystemConfig: systemConfig)
 
     // Create and install regex routing middleware with logging
     let regexRouter = app.regexRouter(with: app.logger)
@@ -81,7 +81,7 @@ func configure(_ app: Application) async throws {
     try app.register(collection: ContainerResizeRoute(client: containerClient))
     try app.register(collection: ContainerRestartRoute(client: containerClient))
     try app.register(collection: ContainerStartRoute(client: containerClient))
-    try app.register(collection: ContainerStatsRoute())
+    try app.register(collection: ContainerStatsRoute(client: containerClient))
     try app.register(collection: ContainerStopRoute(client: containerClient))
     try app.register(collection: ContainerTopRoute())
     try app.register(collection: ContainerUnpauseRoute())
